@@ -51,6 +51,69 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item target/release/oxide-flux.exe, target/release/fluxd.exe, README.md, LICENSE, THIRD_PARTY.md $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/oxide-flux-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # windows-latest images normally ship NSIS; choco is the fallback.
+          $nsisRoot = ${env:ProgramFiles(x86)}
+          if (-not $nsisRoot) { $nsisRoot = $env:ProgramFiles }
+          $makensis = Join-Path $nsisRoot "NSIS\makensis.exe"
+          if (Test-Path $makensis) {
+            Write-Host "NSIS already installed at $makensis"
+            exit 0
+          }
+          choco install nsis -y --no-progress
+          if (-not (Test-Path $makensis)) {
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($cmd) { Write-Host "Using $($cmd.Source)"; exit 0 }
+            throw "NSIS not found after choco install"
+          }
+      - name: Build Windows installer (NSIS, per-user)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nsisRoot = ${env:ProgramFiles(x86)}
+          if (-not $nsisRoot) { $nsisRoot = $env:ProgramFiles }
+          $makensis = Join-Path $nsisRoot "NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) {
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if (-not $cmd) { throw "makensis not found; the Install NSIS step should have provided it" }
+            $makensis = $cmd.Source
+          }
+
+          # VERSION is the display version (tag without the leading v).
+          # FILEVERSION must be four numeric fields for the PE version resource.
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $parts = @($version -split '[^0-9]+' | Where-Object { $_ -ne '' } | Select-Object -First 4)
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $fileVersion = $parts -join '.'
+
+          $stage = Join-Path $PWD "stage"
+          $license = Join-Path $PWD "LICENSE"
+          $dist = Join-Path $PWD "dist"
+          $out = Join-Path $dist "oxide-flux-$env:GITHUB_REF_NAME-windows-x86_64-setup.exe"
+
+          & $makensis `
+            "/DVERSION=$version" `
+            "/DFILEVERSION=$fileVersion" `
+            "/DSTAGEDIR=$stage" `
+            "/DLICENSEFILE=$license" `
+            "/DOUTFILE=$out" `
+            "installer/oxide-flux.nsi"
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path $out)) { throw "installer was not produced at $out" }
+          Get-Item $out | Format-List Name, Length
+      - name: Sign installer (Authenticode, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          $setup = Join-Path (Join-Path $PWD "dist") "oxide-flux-$env:GITHUB_REF_NAME-windows-x86_64-setup.exe"
+          & signtool sign /f $pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed for $setup" }
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -73,6 +136,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: "dist/oxide-flux-${{ github.ref_name }}.spdx.json"
+          # The SBOM is attached to the release by gh below, not by the action.
+          upload-artifact: false
+          upload-release-assets: false
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS

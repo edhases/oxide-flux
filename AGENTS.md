@@ -75,6 +75,11 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
 - **Persistence replays `add`**: `SessionHandle::start` loads `.fluxd-state.json` and pushes
   each torrent through the normal add path, then applies priorities and `paused`. Corrupt or
   version-2 state is a hard error, never silently dropped.
+- **Background saves are serialized by their `JoinHandle`, not by a completion message.**
+  `flush_persist` sees a finished write through `save_task.is_finished()`, and
+  `persist_now` awaits the in-flight handle before its final synchronous write. Awaiting is
+  required because `save_async` runs on `spawn_blocking` and aborting would not stop the
+  write; without this, a stale snapshot could land after shutdown and resurrect old state.
 - **Tests must stay offline.** Tracker/DHT tests use loopback sockets only; every daemon
   test config sets `enable_dht: false` (otherwise bootstrap DNS resolution runs).
 - **The UI is embedded, not built.** `flux-api/static/{index.html,app.js,style.css}` are
@@ -102,6 +107,17 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
 - **Play flow:** the UI asks the supervisor for a stream URL; the supervisor sets sequential
   mode + playhead to the file's first piece, then the app resolves the window HWND, scale and
   size and calls `play_embedded` with a physical-pixel rectangle.
+- **Playback engine is user-selectable.** Settings chooses Bundled / System / Custom / Disabled.
+  "Install playback engine" downloads a pinned, SHA-256-verified GPL mpv build into
+  `%APPDATA%\OxideFlux\playback\mpv` (never system-wide); `Remove playback engine` deletes it.
+  Keep the pinned version and digest in `flux-app/src/playback.rs` in sync with THIRD_PARTY.
+- **Auto-update is signed by checksums, not Authenticode.** `flux-app/src/update.rs` checks
+  GitHub releases, pins the audited tag, verifies `SHA256SUMS` + the GitHub asset digest, and
+  only reports success when `self_update` actually replaced the binary. A failed check is
+  silent. Do not loosen the version pinning.
+- **Release assets** come from `.github/workflows/release.yml`: Windows NSIS setup, Windows zip,
+  Linux tarball, SPDX SBOM, `SHA256SUMS`, and a keyless cosign bundle. Signing options and the
+  post-2023 no-PFX rule are documented in `docs/release.md`.
 - **A block must be requested from the peer that sends it.** `Picker` rejects unsolicited
   blocks (`BlockNotRequested`); late duplicates are ignored without punishing the peer, and a
   corrupt piece records its contributors. A sole contributor is banned, as is a peer with three
@@ -149,7 +165,8 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
 2. uTP/LEDBAT; PEX + LSD (PEX needs a BEP 10 handshake in normal swarms); UPnP/NAT-PMP/PCP;
    IPv6 listener.
 3. v2 Merkle verification; web seeds and scrape.
-4. Add sheet with file tree before adding; settings screen; per-torrent save path; share
-   limits and RSS/watch folder.
-5. Windows installer (signed) and auto-update; macOS validation; virtualised table.
+4. Add sheet with file tree before adding; per-torrent save path; share limits and RSS/watch
+   folder.
+5. Windows Authenticode via SignPath Foundation or Azure Trusted Signing (workflow + docs are
+   ready; an account/approval is required), macOS validation, virtualised table.
 6. Native `io_uring`/IOCP backend behind `BlockBackend`.

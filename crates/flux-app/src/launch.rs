@@ -46,18 +46,68 @@ pub struct Options {
     pub version: bool,
 }
 
+/// Which playback engine to use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlaybackBackend {
+    /// `playback/mpv/mpv.exe` next to the application, falling back to `PATH`.
+    #[default]
+    Bundled,
+    /// A system-installed mpv (`mpv.exe`/`mpv` on `PATH`, or `OXIDE_FLUX_MPV`).
+    System,
+    /// An explicit executable path from [`PlaybackSettings::mpv_path`].
+    Custom,
+    /// Do not play media at all.
+    Disabled,
+}
+
+impl PlaybackBackend {
+    /// Every option, in menu order.
+    pub const ALL: [Self; 4] = [Self::Bundled, Self::System, Self::Custom, Self::Disabled];
+
+    /// Display label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bundled => "Bundled mpv",
+            Self::System => "System mpv",
+            Self::Custom => "Custom path",
+            Self::Disabled => "Disabled",
+        }
+    }
+}
+
+impl std::fmt::Display for PlaybackBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Playback-related settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlaybackSettings {
+    /// Selected backend.
+    pub backend: PlaybackBackend,
+    /// Explicit mpv path for [`PlaybackBackend::Custom`].
+    pub mpv_path: Option<PathBuf>,
+}
+
 /// Persistent desktop settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Register `.torrent`/`magnet:` associations on startup.
     pub register_associations: bool,
+    /// Playback engine choice.
+    pub playback: PlaybackSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             register_associations: true,
+            playback: PlaybackSettings::default(),
         }
     }
 }
@@ -98,6 +148,8 @@ pub struct Initial {
     pub notices: Vec<String>,
     /// Queue for links received while the window is open.
     pub queue: Option<RequestQueue>,
+    /// Persisted desktop settings.
+    pub settings: Settings,
 }
 
 /// Result of [`prepare`].
@@ -270,6 +322,7 @@ pub fn prepare(args: impl IntoIterator<Item = OsString>) -> Result<Plan, String>
             let mut initial = Initial {
                 queue: Some(instance.queue().clone()),
                 notices,
+                settings: settings.clone(),
                 ..Initial::default()
             };
             match instance.queue().drain() {
@@ -287,6 +340,7 @@ pub fn prepare(args: impl IntoIterator<Item = OsString>) -> Result<Plan, String>
                 requests: target.into_iter().collect(),
                 notices,
                 queue: None,
+                settings: settings.clone(),
             }))
         }
     }
@@ -331,6 +385,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         let settings = Settings {
             register_associations: false,
+            playback: PlaybackSettings::default(),
         };
         settings.save(&path).unwrap();
         let loaded = Settings::load(&path);

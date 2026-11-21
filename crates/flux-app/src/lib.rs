@@ -6,11 +6,13 @@ pub mod app;
 pub mod icons;
 pub mod launch;
 pub mod platform;
+pub mod playback;
 pub mod player;
 pub mod single_instance;
 pub mod style;
 pub mod supervisor;
 pub mod theme;
+pub mod update;
 
 pub use app::{App, Filter, Message, format_bytes, format_duration, run};
 pub use launch::{Initial, Plan};

@@ -49,10 +49,45 @@ native desktop app.
 The desktop app talks to the engine in-process through a bounded command/event
 channel; the headless daemon serves the same engine over the API.
 
+## Install (Windows)
+
+Releases are on the [releases page](https://github.com/edhases/oxide-flux/releases).
+Pick one of:
+
+- `oxide-flux-<tag>-windows-x86_64-setup.exe` — per-user installer. No
+  administrator rights; installs to `%LOCALAPPDATA%\Programs\OxideFlux`, adds a
+  Start Menu entry and an optional desktop shortcut, and registers an
+  uninstaller in Settings → Apps. It asks you to close a running instance rather
+  than killing it.
+- `oxide-flux-<tag>-windows-x86_64.zip` — the same `oxide-flux.exe`,
+  `fluxd.exe`, README, LICENSE and THIRD_PARTY files without an installer; run
+  the `.exe` from wherever you unpack it.
+
+`.torrent` and `magnet:` are registered for the current user on first launch
+(`--register`, `--unregister`, `--no-register` override this). Uninstalling runs
+`oxide-flux.exe --unregister`, removes the Start Menu/desktop shortcuts and the
+program files, and leaves your session state in `%APPDATA%\OxideFlux` alone.
+
+Current builds are **not Authenticode-signed** unless a signing identity is
+configured, so SmartScreen may warn. Every asset is covered by `SHA256SUMS` and
+a keyless cosign signature; see [`docs/release.md`](docs/release.md) for the
+verification commands and the signing roadmap.
+
+### Playback engine (optional)
+
+The installer is deliberately small. Open **Settings → Playback** and press
+**Install playback engine** to download a pinned, SHA-256-verified GPL mpv build
+from
+[shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake)
+into `%APPDATA%\OxideFlux\playback\mpv`. The same screen can use a system mpv, a
+custom `mpv.exe` path, or disable playback. The download needs network access;
+the archive is never installed system-wide and **Remove playback engine** deletes
+it again.
+
 ## Quick start
 
-Playback embedding needs **mpv** on `PATH` (or `OXIDE_FLUX_MPV` pointing at
-`mpv.exe`); without it the Play button falls back to an external player.
+Playback needs an mpv engine: install it from Settings (see above), have
+**mpv** on `PATH`, or point `OXIDE_FLUX_MPV` at `mpv.exe`.
 
 ```sh
 cargo run -p flux-app --bin oxide-flux        # desktop client

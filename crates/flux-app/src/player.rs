@@ -76,6 +76,8 @@ pub enum PlayerError {
 pub struct Player {
     child: Option<Child>,
     title: Option<String>,
+    /// Explicit mpv executable, overriding environment/PATH lookup.
+    executable: Option<PathBuf>,
     /// The child window mpv draws into, when playback is embedded.
     #[cfg(windows)]
     embedding: Option<windows::Session>,
@@ -92,6 +94,21 @@ impl Player {
     #[must_use]
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Selects the mpv executable. `None` falls back to `OXIDE_FLUX_MPV`/`PATH`.
+    pub fn configure(&mut self, executable: Option<PathBuf>) {
+        self.executable = executable;
+    }
+
+    /// Whether an mpv executable can be resolved right now.
+    #[must_use]
+    pub fn can_play(&self) -> bool {
+        self.resolved_executable().is_some()
+    }
+
+    fn resolved_executable(&self) -> Option<PathBuf> {
+        self.executable.clone().or_else(mpv_executable)
     }
 
     /// Whether a player process is still running.
@@ -134,7 +151,7 @@ impl Player {
     /// [`PlayerError::Spawn`] when it exists but fails to start.
     pub fn play(&mut self, path: &Path, title: &str) -> Result<(), PlayerError> {
         self.stop();
-        let executable = require_mpv(mpv_executable)?;
+        let executable = require_mpv(|| self.resolved_executable())?;
         self.spawn_external(&executable, path, title)
     }
 
@@ -237,7 +254,7 @@ impl Player {
         title: &str,
     ) -> Result<(), PlayerError> {
         self.stop();
-        let executable = require_mpv(mpv_executable)?;
+        let executable = require_mpv(|| self.resolved_executable())?;
         match windows::Session::start(parent, bounds, &executable, path) {
             Ok((session, child)) => {
                 self.child = Some(child);

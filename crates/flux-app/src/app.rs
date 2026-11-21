@@ -22,12 +22,14 @@ use iced::{
 use iced::{font, keyboard, window};
 
 use crate::icons::{self, icon};
-use crate::launch::Initial;
+use crate::launch::{Initial, PlaybackBackend, PlaybackSettings, Settings};
+use crate::playback;
 use crate::player::{self, Bounds, Player};
 use crate::single_instance::{OpenRequest, RequestQueue};
 use crate::style;
 use crate::supervisor::{self, Command, Event};
 use crate::theme::{self, T, metrics, type_scale};
+use crate::update::{self, AvailableUpdate};
 
 const BODY: f32 = type_scale::BODY;
 const CAPTION: f32 = type_scale::CAPTION;
@@ -252,11 +254,27 @@ pub enum Message {
     WindowScale(f32),
     Resized(iced::Size),
     StopPlayback,
+    OpenSettings,
+    CloseSettings,
+    BackendChanged(PlaybackBackend),
+    MpvPathChanged(String),
+    SaveSettings,
+    InstallPlugin,
+    PluginInstalled(Result<String, String>),
+    RemovePlugin,
+    PluginRemoved(Result<(), String>),
     Dropped(PathBuf),
     DragHover(bool),
     CloseRequested,
     ClearFilters,
     ClearError,
+    /// The background release check finished; `None` means no update or a
+    /// silent failure.
+    UpdateChecked(Option<AvailableUpdate>),
+    /// The user asked to install the offered release.
+    InstallUpdate,
+    /// The background install finished: the installed version, or the error.
+    UpdateInstalled(Result<String, String>),
 }
 
 /// Application state.
@@ -292,6 +310,15 @@ pub struct App {
     window_size: iced::Size,
     pending_stream: Option<(String, String)>,
     playing: Option<String>,
+    update_checked: bool,
+    available_update: Option<String>,
+    update_busy: bool,
+    update_message: Option<String>,
+    settings: Settings,
+    settings_open: bool,
+    settings_backend: PlaybackBackend,
+    settings_mpv_path: String,
+    plugin_busy: bool,
 }
 
 impl App {
@@ -341,7 +368,11 @@ impl App {
             magnet_input: String::new(),
             error,
             dismissed_error: None,
-            player: Player::new(),
+            player: {
+                let mut player = Player::new();
+                apply_playback(&mut player, &initial.settings);
+                player
+            },
             dht,
             initial_requests: initial.requests,
             queue: initial.queue,
@@ -355,6 +386,21 @@ impl App {
             window_size: iced::Size::new(1280.0, 800.0),
             pending_stream: None,
             playing: None,
+            update_checked: false,
+            available_update: None,
+            update_busy: false,
+            update_message: None,
+            settings: initial.settings.clone(),
+            settings_open: false,
+            settings_backend: initial.settings.playback.backend,
+            settings_mpv_path: initial
+                .settings
+                .playback
+                .mpv_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            plugin_busy: false,
         }
     }
 
@@ -379,6 +425,10 @@ impl App {
         match message {
             Message::Pump => {
                 self.drain_events();
+                if !self.update_checked {
+                    self.update_checked = true;
+                    return Task::perform(check_for_update(), Message::UpdateChecked);
+                }
                 if self.pending_stream.is_some() {
                     self.try_start_playback();
                     if self.pending_stream.is_some() {
@@ -406,7 +456,9 @@ impl App {
                 return iced::widget::operation::focus(search_id());
             }
             Message::Escape => {
-                if self.playing.is_some() {
+                if self.settings_open {
+                    self.settings_open = false;
+                } else if self.playing.is_some() {
                     self.stop_playback();
                 } else {
                     let had_search = !self.search.is_empty();
@@ -507,8 +559,17 @@ impl App {
                 }
             }
             Message::PlayStream { id, file, .. } => {
-                self.error = None;
-                let _ = self.commands.send(Command::Play { id, file });
+                if self.settings.playback.backend == PlaybackBackend::Disabled {
+                    self.error = Some("Playback is disabled in Settings.".to_owned());
+                } else if !self.player.can_play() {
+                    self.error = Some(
+                        "mpv was not found. Install it, or set a custom path in Settings."
+                            .to_owned(),
+                    );
+                } else {
+                    self.error = None;
+                    let _ = self.commands.send(Command::Play { id, file });
+                }
             }
             Message::StreamReady { url, title } => {
                 self.pending_stream = Some((url, title));
@@ -542,6 +603,52 @@ impl App {
                 }
             }
             Message::StopPlayback => self.stop_playback(),
+            Message::OpenSettings => {
+                self.settings_backend = self.settings.playback.backend;
+                self.settings_mpv_path = self
+                    .settings
+                    .playback
+                    .mpv_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                self.settings_open = true;
+            }
+            Message::CloseSettings => self.settings_open = false,
+            Message::BackendChanged(backend) => self.settings_backend = backend,
+            Message::MpvPathChanged(path) => self.settings_mpv_path = path,
+            Message::SaveSettings => self.save_settings(),
+            Message::InstallPlugin => {
+                self.plugin_busy = true;
+                return Task::perform(install_plugin(), Message::PluginInstalled);
+            }
+            Message::PluginInstalled(result) => {
+                self.plugin_busy = false;
+                match result {
+                    Ok(path) => {
+                        self.settings_backend = PlaybackBackend::Bundled;
+                        self.settings.playback.backend = PlaybackBackend::Bundled;
+                        apply_playback(&mut self.player, &self.settings);
+                        self.save_settings();
+                        self.update_message = Some(format!("Playback engine installed at {path}"));
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            Message::RemovePlugin => {
+                self.plugin_busy = true;
+                return Task::perform(remove_plugin(), Message::PluginRemoved);
+            }
+            Message::PluginRemoved(result) => {
+                self.plugin_busy = false;
+                match result {
+                    Ok(()) => {
+                        apply_playback(&mut self.player, &self.settings);
+                        self.update_message = Some("Playback engine removed".to_owned());
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
             Message::Dropped(path) => {
                 self.drag_hover = false;
                 if path
@@ -580,6 +687,30 @@ impl App {
             Message::ClearError => {
                 self.error = None;
                 self.dismissed_error = self.torrent_error();
+            }
+            Message::UpdateChecked(update) => {
+                self.available_update = update.map(|update| update.version);
+            }
+            Message::InstallUpdate => {
+                if !self.update_busy {
+                    self.update_busy = true;
+                    self.update_message = None;
+                    return Task::perform(install_update(), Message::UpdateInstalled);
+                }
+            }
+            Message::UpdateInstalled(result) => {
+                self.update_busy = false;
+                match result {
+                    Ok(version) => {
+                        self.available_update = None;
+                        self.update_message =
+                            Some(format!("Updated to {version} — restart Oxide Flux"));
+                    }
+                    Err(error) => {
+                        self.update_message = None;
+                        self.error = Some(error);
+                    }
+                }
             }
         }
         Task::none()
@@ -625,6 +756,117 @@ impl App {
         self.player.stop();
         self.playing = None;
         self.pending_stream = None;
+    }
+
+    fn save_settings(&mut self) {
+        let mpv_path = if self.settings_backend == PlaybackBackend::Custom {
+            let path = PathBuf::from(self.settings_mpv_path.trim());
+            if !path.is_file() {
+                self.error = Some(format!("`{}` is not an mpv executable", path.display()));
+                return;
+            }
+            Some(path)
+        } else {
+            None
+        };
+        self.settings.playback = PlaybackSettings {
+            backend: self.settings_backend,
+            mpv_path,
+        };
+        apply_playback(&mut self.player, &self.settings);
+        let path = crate::launch::config_dir().join("settings.json");
+        if let Err(error) = self.settings.save(&path) {
+            self.error = Some(format!("cannot save settings: {error}"));
+            return;
+        }
+        self.settings_open = false;
+    }
+
+    fn settings_panel(&self) -> Element<'_, Message> {
+        let installed = playback::installed_version();
+        let bundled = playback::bundled_mpv();
+        let status = match (&installed, &bundled) {
+            (Some(version), Some(path)) => {
+                format!("Bundled mpv {version} at {}", path.display())
+            }
+            (Some(version), None) => format!("Bundled mpv {version} installed"),
+            (None, Some(path)) => format!("mpv found at {}", path.display()),
+            (None, None) => format!(
+                "No bundled mpv. The optional plugin downloads GPL mpv ({}) from the upstream project.",
+                playback::download_size()
+            ),
+        };
+
+        let engine = pick_list(
+            &PlaybackBackend::ALL[..],
+            Some(self.settings_backend),
+            Message::BackendChanged,
+        )
+        .style(style::pick)
+        .text_size(BODY)
+        .width(240);
+
+        let mut rows = column![
+            text("Settings").size(type_scale::HEADING).font(semibold()),
+            section("PLAYBACK"),
+            row![text("Engine").size(BODY).color(T.text_secondary), engine,]
+                .spacing(16)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(12);
+
+        if self.settings_backend == PlaybackBackend::Custom {
+            rows = rows.push(
+                text_input("C:\\path\\to\\mpv.exe", &self.settings_mpv_path)
+                    .on_input(Message::MpvPathChanged)
+                    .style(style::input)
+                    .padding([7, 10])
+                    .size(BODY),
+            );
+        }
+        rows = rows.push(text(status).size(CAPTION).color(T.text_muted));
+
+        let present = installed.is_some() || bundled.is_some();
+        let plugin = if present {
+            button("Remove playback engine")
+                .on_press_maybe((!self.plugin_busy).then_some(Message::RemovePlugin))
+                .style(style::secondary)
+                .padding([0, 16])
+                .height(32)
+        } else {
+            button(text(format!(
+                "Install playback engine ({})",
+                playback::download_size()
+            )))
+            .on_press_maybe((!self.plugin_busy).then_some(Message::InstallPlugin))
+            .style(style::secondary)
+            .padding([0, 16])
+            .height(32)
+        };
+        rows = rows.push(plugin);
+        rows = rows.push(Space::new().height(8));
+        rows = rows.push(
+            row![
+                button("Cancel")
+                    .on_press(Message::CloseSettings)
+                    .style(style::secondary)
+                    .padding([0, 16])
+                    .height(34),
+                button("Save")
+                    .on_press(Message::SaveSettings)
+                    .style(style::primary)
+                    .padding([0, 16])
+                    .height(34),
+            ]
+            .spacing(8),
+        );
+
+        container(rows)
+            .padding(24)
+            .width(Fill)
+            .height(Fill)
+            .style(style::surface)
+            .into()
     }
 
     fn request_window(&self) -> Task<Message> {
@@ -820,10 +1062,56 @@ impl App {
         .padding([0, 14])
         .height(36);
 
+        // Offered only after a successful check; a failed check stays silent.
+        let update: Element<'_, Message> = match &self.available_update {
+            Some(version) => {
+                let label = if self.update_busy {
+                    format!("Updating to v{version}…")
+                } else {
+                    format!("Update v{version}")
+                };
+                button(
+                    row![
+                        icon(
+                            icons::DOWNLOAD,
+                            16.0,
+                            if self.update_busy {
+                                T.text_disabled
+                            } else {
+                                T.text_primary
+                            }
+                        ),
+                        text(label).size(BODY).font(medium()),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .on_press_maybe((!self.update_busy).then_some(Message::InstallUpdate))
+                .style(style::secondary)
+                .padding([0, 14])
+                .height(36)
+                .into()
+            }
+            None => Space::new().width(0).into(),
+        };
+
         container(
-            row![brand, Space::new().width(Fill), search, add, magnet,]
-                .spacing(8)
-                .align_y(Alignment::Center),
+            row![
+                brand,
+                Space::new().width(Fill),
+                search,
+                add,
+                magnet,
+                update,
+                button(icon(icons::SETTINGS, 16.0, T.text_secondary))
+                    .on_press(Message::OpenSettings)
+                    .style(style::icon)
+                    .padding([9, 9])
+                    .height(36)
+                    .width(36),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         )
         .padding([0, 24])
         .height(metrics::HEADER)
@@ -889,6 +1177,9 @@ impl App {
     }
 
     fn body(&self) -> Element<'_, Message> {
+        if self.settings_open {
+            return self.settings_panel();
+        }
         if let Some(title) = &self.playing {
             return container(
                 column![
@@ -1730,44 +2021,70 @@ impl App {
             "torrents"
         };
 
-        container(
-            row![
-                text(format!(
-                    "{} {noun} · {} active · {} seeding · {} paused{selection}",
-                    self.stats.torrents, self.stats.active, self.stats.seeding, self.stats.paused
-                ))
+        let mut status = row![
+            text(format!(
+                "{} {noun} · {} active · {} seeding · {} paused{selection}",
+                self.stats.torrents, self.stats.active, self.stats.seeding, self.stats.paused
+            ))
+            .size(CAPTION)
+            .color(T.text_muted),
+            Space::new().width(20),
+            text(if self.dht { "DHT on" } else { "DHT off" })
                 .size(CAPTION)
                 .color(T.text_muted),
-                Space::new().width(20),
-                text(if self.dht { "DHT on" } else { "DHT off" })
-                    .size(CAPTION)
-                    .color(T.text_muted),
-                Space::new().width(Fill),
-                text(format!("session {}", ratio_label(&self.stats)))
-                    .size(CAPTION)
-                    .color(T.text_muted),
-                Space::new().width(20),
-                text(format!(
-                    "↓ {}/s   ↑ {}/s",
-                    format_bytes(down),
-                    format_bytes(up)
-                ))
+        ];
+        if let Some(message) = &self.update_message {
+            status = status.push(Space::new().width(20));
+            status = status.push(text(message.clone()).size(CAPTION).color(T.success));
+        }
+        status = status.push(Space::new().width(Fill));
+        status = status.push(
+            text(format!("session {}", ratio_label(&self.stats)))
                 .size(CAPTION)
-                .color(T.text_secondary),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .padding([0, 16])
-        .height(metrics::STATUS)
-        .width(Fill)
-        .style(style::status_bar)
-        .into()
+                .color(T.text_muted),
+        );
+        status = status.push(Space::new().width(20));
+        status = status.push(
+            text(format!(
+                "↓ {}/s   ↑ {}/s",
+                format_bytes(down),
+                format_bytes(up)
+            ))
+            .size(CAPTION)
+            .color(T.text_secondary),
+        );
+
+        container(status.align_y(Alignment::Center))
+            .padding([0, 16])
+            .height(metrics::STATUS)
+            .width(Fill)
+            .style(style::status_bar)
+            .into()
     }
 }
 
 impl Default for App {
     fn default() -> Self {
         Self::new(Initial::default())
+    }
+}
+
+/// Runs the blocking release check off the UI thread. A join failure or a failed
+/// check is indistinguishable from "no update": the check is silent.
+async fn check_for_update() -> Option<AvailableUpdate> {
+    tokio::task::spawn_blocking(|| update::check(env!("CARGO_PKG_VERSION")))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+}
+
+/// Downloads, verifies and installs the newest release off the UI thread.
+async fn install_update() -> Result<String, String> {
+    match tokio::task::spawn_blocking(|| update::install(env!("CARGO_PKG_VERSION"))).await {
+        Ok(Ok(version)) => Ok(version),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(format!("update install failed: {error}")),
     }
 }
 
@@ -2046,6 +2363,36 @@ fn play_button(id: String, file: usize, title: String, enabled: bool) -> Element
     .height(24)
     .width(64)
     .into()
+}
+
+fn apply_playback(player: &mut Player, settings: &Settings) {
+    let executable = match settings.playback.backend {
+        PlaybackBackend::Bundled => playback::bundled_mpv(),
+        PlaybackBackend::System => None,
+        PlaybackBackend::Custom => settings
+            .playback
+            .mpv_path
+            .clone()
+            .filter(|path| path.is_file()),
+        PlaybackBackend::Disabled => None,
+    };
+    player.configure(executable);
+}
+
+async fn install_plugin() -> Result<String, String> {
+    match tokio::task::spawn_blocking(playback::install).await {
+        Ok(Ok(path)) => Ok(path.display().to_string()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn remove_plugin() -> Result<(), String> {
+    match tokio::task::spawn_blocking(playback::remove).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn raw_hwnd(window: &dyn window::Window) -> Option<isize> {
