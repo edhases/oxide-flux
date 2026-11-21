@@ -1180,6 +1180,8 @@ mod tests {
             accept(stream, config).await.expect("server handshake")
         });
         let mut raw = TcpStream::connect(addr).await.expect("raw connect");
+        raw.set_nodelay(true)
+            .expect("disable Nagle on the raw side");
         write_raw_handshake(&mut raw, HASH, CLIENT_ID).await;
         let ours = read_raw_handshake(&mut raw).await;
         assert_eq!(ours.info_hash(), &HASH);
@@ -1630,13 +1632,15 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
-        // The keep-alive, then a message that proves both were read.
-        raw.write_all(&[0, 0, 0, 0])
+        // The keep-alive, then a message that proves both were read. Send them
+        // in one write: two small writes let Nagle/delayed-ACK hold the second
+        // frame on Linux while the virtual-time timeout fires.
+        let have = encode(&Message::Have { index: 4 }).expect("encode have");
+        let mut frames = vec![0, 0, 0, 0];
+        frames.extend_from_slice(&have);
+        raw.write_all(&frames)
             .await
-            .expect("write keep-alive");
-        raw.write_all(&encode(&Message::Have { index: 4 }).expect("encode have"))
-            .await
-            .expect("write have");
+            .expect("write keep-alive and have");
         assert_eq!(recv(&mut events).await, PeerEvent::Have(4));
 
         // Past the original deadline (150 s from the start), but not past the
