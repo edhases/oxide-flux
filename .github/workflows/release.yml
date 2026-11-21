@@ -136,15 +136,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Generate SBOM (SPDX JSON)
-        uses: anchore/sbom-action@v0
-        with:
-          path: .
-          format: spdx-json
-          output-file: "dist/oxide-flux-${{ github.ref_name }}.spdx.json"
-          # The SBOM is attached to the release by gh below, not by the action.
-          upload-artifact: false
-          upload-release-assets: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom --locked
+      - name: Generate SBOM (SPDX 2.3, Cargo-native)
+        run: |
+          cargo sbom --output-format spdx_json_2_3 \
+            > "dist/oxide-flux-${GITHUB_REF_NAME}.spdx.json"
+          test -s "dist/oxide-flux-${GITHUB_REF_NAME}.spdx.json"
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS
