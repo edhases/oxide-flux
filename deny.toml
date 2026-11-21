@@ -1,0 +1,59 @@
+# cargo-deny policy for Oxide Flux.
+# Run locally with `cargo deny check`; CI runs the same file.
+
+[graph]
+targets = [
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[advisories]
+version = 2
+yanked = "warn"
+# Unmaintained transitive crates pinned by iced 0.14's text/Linux-portal stack.
+# None has a safe upgrade inside the current iced release; revisit on every iced
+# upgrade. They are not vulnerabilities, only maintenance advisories.
+ignore = [
+  "RUSTSEC-2026-0206", # rustybuzz (iced text shaping)
+  "RUSTSEC-2026-0192", # ttf-parser (iced text shaping)
+  "RUSTSEC-2026-0370", # zvariant (iced_winit -> zbus, Linux)
+  "RUSTSEC-2026-0371", # zbus_names (iced_winit -> zbus, Linux)
+  "RUSTSEC-2026-0372", # zvariant_derive (iced_winit -> zbus, Linux)
+]
+
+[licenses]
+version = 2
+# Permissive licenses, plus GPL-3.0-or-later because the project itself is GPL
+# and the embedded playback path depends on GPLv2+ mpv.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "BSL-1.0",
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "Unlicense",
+  "CC0-1.0",
+  "GPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+# Workspace path dependencies (flux-core, flux-disk, …) are the normal Rust
+# workspace pattern; they are not crates.io wildcards.
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

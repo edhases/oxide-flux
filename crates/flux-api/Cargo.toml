@@ -1,0 +1,31 @@
+[package]
+name = "flux-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Control-plane transport for Oxide Flux: JSON-RPC 2.0 over HTTP plus a WebSocket event stream"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

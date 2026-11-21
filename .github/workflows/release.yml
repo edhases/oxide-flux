@@ -1,0 +1,92 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write # cosign keyless signing via GitHub OIDC
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+      WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: GUI dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev libfontconfig1-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --bin oxide-flux --bin fluxd
+      - name: Sign Windows binaries (Authenticode, optional)
+        if: runner.os == 'Windows' && env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          foreach ($binary in @("target/release/oxide-flux.exe", "target/release/fluxd.exe")) {
+            & signtool sign /f $pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 `
+              /tr http://timestamp.digicert.com /td SHA256 $binary
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $binary" }
+          }
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $stage = "stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/oxide-flux.exe, target/release/fluxd.exe, README.md, LICENSE, THIRD_PARTY.md $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/oxide-flux-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist stage
+          cp target/release/oxide-flux target/release/fluxd README.md LICENSE THIRD_PARTY.md stage/
+          tar -czf "dist/oxide-flux-$GITHUB_REF_NAME-linux-x86_64.tar.gz" -C stage .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign checksums (keyless, OIDC)
+        working-directory: dist
+        run: |
+          cosign sign-blob --yes SHA256SUMS \
+            --bundle oxide-flux-checksums.cosign.bundle
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Oxide Flux $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

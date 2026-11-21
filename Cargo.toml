@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/flux-core",
+    "crates/flux-disk",
+    "crates/flux-net",
+    "crates/flux-api",
+    "crates/flux-daemon",
+    "crates/flux-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"

@@ -6,9 +6,10 @@ native desktop app.
 > **Status: preview.** It really downloads and seeds over TCP, announces to
 > HTTP/UDP trackers, uses an IPv4 DHT, fetches magnets via `ut_metadata`,
 > persists sessions, exposes a JSON-RPC/WebSocket API, and has a native iced UI
-> with `.torrent`/`magnet:` associations. Still missing: MSE/PE encryption,
-> uTP/LEDBAT, PEX/LSD, web seeds, v2 Merkle verification, and embedded playback
-> (currently launches an external mpv).
+> with `.torrent`/`magnet:` associations. Playback is embedded: mpv is hosted in
+> a child window and fed by a loopback HTTP range server that waits for verified
+> pieces, so a media file can start before the torrent finishes. Still missing:
+> MSE/PE encryption, uTP/LEDBAT, PEX/LSD, web seeds and v2 Merkle verification.
 
 ## Features
 
@@ -28,7 +29,11 @@ native desktop app.
   in-process.
 - **Desktop:** native iced 0.14 shell, embedded Inter + Lucide assets, search,
   sorting, selective file priorities, per-torrent playhead/streaming mode,
-  graceful shutdown, single instance, per-user file associations.
+  embedded mpv playback (external player as fallback), graceful shutdown,
+  single instance, per-user file associations.
+- **Streaming:** a loopback HTTP range server serves only hash-verified bytes and
+  blocks until the requested pieces arrive; `torrent.setStreamingMode` and
+  `torrent.setPlayhead` steer the picker for playback.
 
 ## Architecture
 
@@ -45,6 +50,9 @@ The desktop app talks to the engine in-process through a bounded command/event
 channel; the headless daemon serves the same engine over the API.
 
 ## Quick start
+
+Playback embedding needs **mpv** on `PATH` (or `OXIDE_FLUX_MPV` pointing at
+`mpv.exe`); without it the Play button falls back to an external player.
 
 ```sh
 cargo run -p flux-app --bin oxide-flux        # desktop client

@@ -47,10 +47,11 @@ CI (`.github/workflows/ci.yml`) runs fmt → clippy → test on ubuntu + windows
 - `flux-api` — JSON-RPC over HTTP + WebSocket, `Engine` trait, `MockEngine`, bearer auth,
   and an embedded static WebUI (`static/`, served at `/` with a CSP; no build step).
 - `flux-daemon` — config, session actor, swarm (peers/requests/choking/uploads), tracker
-  announce service, magnet fetch, state persistence, `Engine` adapter, `fluxd` CLI.
+  announce service, magnet fetch, loopback streaming server, state persistence, `Engine`
+  adapter, `fluxd` CLI.
 - `flux-app` — native iced 0.14 desktop client: in-process session, design tokens
   (`theme.rs`/`style.rs`), embedded Inter + Lucide assets, launch/association/single-instance
-  handling, external-mpv playback for now.
+  handling, embedded mpv playback with a loopback stream URL.
 
 Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + net`,
 `net → core`. Don't make `core`/`disk`/`net` depend on `api` or `daemon`.
@@ -90,8 +91,17 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
   (`.tmp` then rename) or the window will read half a URI.
 - **Drag & drop accepts `.torrent` only** (`window::Event::FileDropped`); magnets arrive via
   paste, CLI, or the `magnet:` association.
-- **Desktop playback is external mpv** (launched by `flux-app/src/player.rs`). The embedded
-  child-window path is the next milestone; don't describe it as in-app yet.
+- **Desktop playback is embedded mpv.** `player::play_embedded(parent_hwnd, bounds, path, title)`
+  creates a child Win32 window and runs mpv with `--wid`; resize via `set_bounds`. If mpv is
+  missing or the HWND is unavailable, it falls back to the external `play`. Do not describe
+  playback as external-only.
+- **Streaming serves verified bytes only.** `flux-daemon/src/stream.rs` is a loopback HTTP
+  range server; `stream_source.rs` polls `piece_state` until every covering piece is verified,
+  then reads through `FileSet`. Never return unverified bytes, and keep the server bound to
+  loopback (it has no auth). `Engine::stream_url` caches one server per torrent.
+- **Play flow:** the UI asks the supervisor for a stream URL; the supervisor sets sequential
+  mode + playhead to the file's first piece, then the app resolves the window HWND, scale and
+  size and calls `play_embedded` with a physical-pixel rectangle.
 - **A block must be requested from the peer that sends it.** `Picker` rejects unsolicited
   blocks (`BlockNotRequested`); late duplicates are ignored without punishing the peer, and a
   corrupt piece records its contributors. A sole contributor is banned, as is a peer with three
@@ -134,9 +144,12 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
 
 ## Next work, in dependency order
 
-1. Embedded mpv child window (playback inside the app, resize-aware).
-2. Add sheet with file tree/priorities before adding; dashed drop zone widget.
-3. MSE/PE encryption and uTP/LEDBAT.
-4. PEX + LSD, and v2 Merkle verification (piece layers are parsed, not checked).
-5. Web seeds (BEP 19) and HTTP/UDP scrape.
-6. Native `io_uring`/IOCP backend behind `BlockBackend`; optional bulk-download UI.
+1. MSE/PE encryption (private trackers, DPI) and wiring the existing `RateLimiter` into the
+   peer writer with global/per-torrent caps and LAN exemption.
+2. uTP/LEDBAT; PEX + LSD (PEX needs a BEP 10 handshake in normal swarms); UPnP/NAT-PMP/PCP;
+   IPv6 listener.
+3. v2 Merkle verification; web seeds and scrape.
+4. Add sheet with file tree before adding; settings screen; per-torrent save path; share
+   limits and RSS/watch folder.
+5. Windows installer (signed) and auto-update; macOS validation; virtualised table.
+6. Native `io_uring`/IOCP backend behind `BlockBackend`.

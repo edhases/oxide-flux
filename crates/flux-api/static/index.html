@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Oxide Flux</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>Oxide Flux</h1>
+    <div class="session">
+      <input id="token" type="password" placeholder="API token (blank on loopback)" autocomplete="off">
+      <button id="connect" type="button">Connect</button>
+      <span id="status" class="muted">not connected</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Add</h2>
+      <div class="row">
+        <input id="torrent-file" type="file" accept=".torrent">
+        <button id="add-file" type="button">Add .torrent</button>
+      </div>
+      <div class="row">
+        <input id="magnet" type="text" placeholder="magnet:?xt=urn:btih:..." spellcheck="false">
+        <button id="add-magnet" type="button">Add magnet</button>
+      </div>
+      <form id="json-form" class="row">
+        <input id="json-result" type="text" readonly placeholder="last result">
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="row spread">
+        <h2>Torrents</h2>
+        <span id="stats" class="muted"></span>
+      </div>
+      <ul id="torrents" class="torrents"></ul>
+      <p id="empty" class="muted">No torrents yet.</p>
+    </section>
+
+    <section id="files-panel" class="panel hidden">
+      <div class="row spread">
+        <h2 id="files-title">Files</h2>
+        <button id="files-close" type="button">Close</button>
+      </div>
+      <ul id="files" class="files"></ul>
+    </section>
+
+    <section id="log" class="panel log hidden"></section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
