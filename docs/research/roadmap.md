@@ -37,19 +37,21 @@ Host/Origin required, token mandatory on non-loopback binds). See `AGENTS.md`.
 
 ## Phase 1 — streaming control plane + truthful UI
 
-This is what makes it a *streaming* client rather than a downloader.
+Status: implemented. Playhead/sequential/rarest API, per-file verified progress, truthful
+lifecycle/errors, flush FDM-style layout, table/keyboard work, embedded mpv child window and a
+loopback HTTP range server that waits for verified pieces. Remaining from the original UX spec:
+the Add sheet, settings screen and table virtualization (P1).
 
-1. Playhead/sequential API: expose `set_playhead`, mode switch (sequential/rarest), buffered
-   range, per-file verified bytes. `SwarmHandle::set_playhead` already exists; nothing calls it.
-2. Adapter truth: map `Active→Downloading`, `Seeding→Seeding`, count `stats.downloading`,
-   surface `lastError`; never gate Play on partial data without a contiguous window.
-3. UI truth pass: remove "Sequential streaming ready", `—` for unknown size/ETA/ratio, state
-   colours, completion-gated Play (`gaps-ui.md` G01).
-4. Flush pane layout + 2 px selection bars; table shell (separators, right-aligned numerics,
-   ellipsis, hover menu, double-click).
-5. Keyboard/focus chain: shortcuts, `focus_next/previous`, visible 2 px rings.
-6. Embedded mpv child window (`--wid`, HWND via `window::run` + `raw-window-handle`, host-driven
-   resize/DPI/focus, `--input-ipc-server` for controls) + LICENSE decision.
+1. Playhead/sequential API. Done: `torrent.setPlayhead` / `torrent.setStreamingMode`, persisted
+   per torrent and re-applied when a swarm restarts.
+2. Adapter truth. Done: `Active→Downloading`, `Seeding→Seeding`, `stats.downloading`,
+   `lastError` in `TorrentSummary`.
+3. UI truth pass. Done: no invented labels, `—` for unknown values, state-coloured progress,
+   Play gated on verified coverage.
+4. Flush pane layout and table shell. Done.
+5. Keyboard/focus chain. Done: Ctrl+F, Esc, Space, Delete, visible focus ring.
+6. Embedded mpv. Done: Win32 child window + `--wid`, resize via `set_bounds`, external
+   fallback when mpv/HWND is unavailable; docs updated in `AGENTS.md`.
 
 ## Phase 2 — transport completeness
 
