@@ -29,8 +29,9 @@ native desktop app.
   in-process.
 - **Desktop:** native iced 0.14 shell, embedded Inter + Lucide assets, search,
   sorting, selective file priorities, per-torrent playhead/streaming mode,
-  embedded mpv playback (external player as fallback), graceful shutdown,
-  single instance, per-user file associations.
+  embedded mpv playback (external player as fallback), a settings screen for the
+  playback engine, in-app updates from signed release checksums, graceful
+  shutdown, single instance, per-user file associations.
 - **Streaming:** a loopback HTTP range server serves only hash-verified bytes and
   blocks until the requested pieces arrive; `torrent.setStreamingMode` and
   `torrent.setPlayhead` steer the picker for playback.
@@ -83,6 +84,15 @@ into `%APPDATA%\OxideFlux\playback\mpv`. The same screen can use a system mpv, a
 custom `mpv.exe` path, or disable playback. The download needs network access;
 the archive is never installed system-wide and **Remove playback engine** deletes
 it again.
+
+### Updating
+
+The desktop client checks GitHub releases on startup (silently, and never in
+the way of the window) and shows **Update vX** in the header when a newer stable
+release exists. Installing verifies `SHA256SUMS` and the GitHub asset digest
+before replacing the binary, then asks for a restart; the running version is
+only reported as updated when the replacement actually happened. Without
+Authenticode, Windows may still show a SmartScreen prompt for the new build.
 
 ## Quick start
 

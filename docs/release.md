@@ -143,6 +143,10 @@ Prices and eligibility change; verify on the vendor pages. The practical plan:
 
 ### SignPath wiring (recommended, not yet enabled)
 
+The application answers are prepared in
+[`signpath-application.md`](signpath-application.md); approving it is the only
+step that needs a human.
+
 SignPath signs an **artifact** of the workflow, so the job uploads the files to
 sign, submits the request, and downloads the signed output:
 

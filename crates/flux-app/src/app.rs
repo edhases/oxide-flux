@@ -2369,11 +2369,7 @@ fn apply_playback(player: &mut Player, settings: &Settings) {
     let executable = match settings.playback.backend {
         PlaybackBackend::Bundled => playback::bundled_mpv(),
         PlaybackBackend::System => None,
-        PlaybackBackend::Custom => settings
-            .playback
-            .mpv_path
-            .clone()
-            .filter(|path| path.is_file()),
+        PlaybackBackend::Custom => settings.playback.mpv_path.clone(),
         PlaybackBackend::Disabled => None,
     };
     player.configure(executable);
