@@ -445,7 +445,7 @@ impl SessionHandle {
             restore,
             restore_order,
             persist_pending: false,
-            saving: false,
+            save_task: None,
             dht: dht.clone(),
             dht_tick: tokio::time::interval(DHT_INTERVAL),
         };
@@ -1087,8 +1087,6 @@ enum Internal {
         prefix: Vec<u8>,
         stream: TcpStream,
     },
-    /// The background state write finished.
-    Persisted(Result<(), String>),
     /// Peers discovered through the DHT.
     DhtPeers {
         hash: [u8; 20],
@@ -1113,7 +1111,7 @@ struct Session {
     restore: HashMap<TorrentId, TorrentRecord>,
     restore_order: Vec<TorrentId>,
     persist_pending: bool,
-    saving: bool,
+    save_task: Option<JoinHandle<()>>,
     dht: Option<DhtHandle>,
     dht_tick: tokio::time::Interval,
 }
@@ -1444,14 +1442,6 @@ impl Session {
             } => {
                 self.on_inbound(hash, prefix, stream);
             }
-            Internal::Persisted(result) => {
-                self.saving = false;
-                if let Err(reason) = result {
-                    let _ = self.events.send(Event::Warning(format!(
-                        "session state could not be saved: {reason}"
-                    )));
-                }
-            }
             Internal::DhtPeers { hash, peers } => {
                 self.on_dht_peers(hash, peers);
             }
@@ -1679,7 +1669,18 @@ impl Session {
 
     /// Writes the snapshot once in the background, coalescing bursts.
     fn flush_persist(&mut self) {
-        if !self.persist_pending || self.saving {
+        // A finished write is observed through its handle, so the actor never
+        // has to be interrupted by a completion message. A write still in
+        // flight keeps its slot; `persist_pending` survives until the next tick.
+        if self
+            .save_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        self.save_task = None;
+        if !self.persist_pending {
             return;
         }
         let Some(store) = self.store.clone() else {
@@ -1687,20 +1688,27 @@ impl Session {
             return;
         };
         let snapshot = self.to_snapshot();
-        self.saving = true;
         self.persist_pending = false;
-        let internal = self.internal.clone();
-        tokio::spawn(async move {
-            let result = store
-                .save_async(&snapshot)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = internal.send(Internal::Persisted(result)).await;
-        });
+        let events = self.events.clone();
+        self.save_task = Some(tokio::spawn(async move {
+            if let Err(error) = store.save_async(&snapshot).await {
+                let _ = events.send(Event::Warning(format!(
+                    "session state could not be saved: {error}"
+                )));
+            }
+        }));
     }
 
     /// Writes the snapshot synchronously (shutdown path).
     async fn persist_now(&mut self) {
+        // A background save may still hold an older snapshot. Await it first,
+        // otherwise it could land after this write and resurrect stale state
+        // (for example "paused" flipping back to "running" across a restart).
+        // The task only talks to the broadcast event channel, which never
+        // blocks, so awaiting it here cannot deadlock the actor.
+        if let Some(task) = self.save_task.take() {
+            let _ = task.await;
+        }
         let Some(store) = self.store.clone() else {
             return;
         };
