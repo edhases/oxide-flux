@@ -37,18 +37,21 @@ const SUMMARY_LIMIT: usize = 100_000;
 #[derive(Clone)]
 pub struct DaemonEngine {
     session: SessionHandle,
-    download_dir: PathBuf,
     streams: Arc<Mutex<HashMap<String, StreamServer>>>,
 }
 
 impl DaemonEngine {
-    /// Wraps a session. `download_dir` is what the detail view reports; the
-    /// session already resolved and created it.
+    /// Wraps a session.
+    ///
+    /// `download_dir` is the session's configured directory, accepted so callers
+    /// can construct the engine before the session reports anything. It is not
+    /// stored: every torrent knows its own root, and the detail view reports
+    /// that one, so a torrent added to a different folder is never mislabelled
+    /// with the session default.
     #[must_use]
-    pub fn new(session: SessionHandle, download_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(session: SessionHandle, _download_dir: impl Into<PathBuf>) -> Self {
         Self {
             session,
-            download_dir: download_dir.into(),
             streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -77,7 +80,7 @@ impl DaemonEngine {
                 })
                 .collect(),
             piece_length: u64::from(state.piece_length),
-            download_dir: self.download_dir.display().to_string(),
+            download_dir: state.root.display().to_string(),
         }
     }
 }
@@ -110,9 +113,9 @@ impl Engine for DaemonEngine {
 
     async fn add(&self, source: AddTorrent) -> Result<TorrentSummary, EngineError> {
         let state = match source {
-            AddTorrent::Metainfo { bytes } => self
+            AddTorrent::Metainfo { bytes, save_path } => self
                 .session
-                .add_torrent(bytes)
+                .add_torrent_with_root(bytes, save_path)
                 .await
                 .map_err(map_session_error)?,
             AddTorrent::Magnet { uri } => self

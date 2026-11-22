@@ -3,8 +3,9 @@
 //! The daemon writes one small JSON document next to the downloads, by default
 //! `download_dir/.fluxd-state.json`. Each torrent stores the raw `.torrent`
 //! bytes (hex in the JSON so the file stays text and diffable), the per-file
-//! priorities and whether it is paused. There are no secrets in a snapshot:
-//! no API token, no tracker credentials, no peer addresses.
+//! priorities, whether it is paused, and — only when it lives outside the
+//! session directory — its own download root. There are no secrets in a
+//! snapshot: no API token, no tracker credentials, no peer addresses.
 //!
 //! ## Guarantees
 //!
@@ -70,7 +71,16 @@ pub struct TorrentRecord {
     pub priorities: Vec<u8>,
     /// Whether the torrent is paused.
     pub paused: bool,
-    /// Per-torrent download directory, when it differs from the session root.
+    /// The torrent's own download root, when it differs from the session
+    /// directory; `None` means "use the session's configured directory".
+    ///
+    /// The snapshot is JSON, so the path is text. A root that is not valid UTF-8
+    /// cannot be represented exactly and is recorded lossily (invalid sequences
+    /// become `U+FFFD`) rather than dropped: on restore the torrent is re-rooted
+    /// at that approximation, which is visible and fixable, instead of silently
+    /// falling back to the session directory and stranding the bytes it already
+    /// wrote. Roots chosen by the desktop UI always come from UTF-8 input, so the
+    /// lossy case is a CLI-only edge.
     pub download_dir: Option<String>,
 }
 

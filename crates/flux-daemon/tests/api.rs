@@ -84,7 +84,13 @@ async fn adds_metainfo_and_reports_honest_state() {
     let engine = make_engine(&session, dir.path());
 
     let bytes = single_file("media", 1024, 1024, true);
-    let summary = engine.add(AddTorrent::Metainfo { bytes }).await.unwrap();
+    let summary = engine
+        .add(AddTorrent::Metainfo {
+            bytes,
+            save_path: None,
+        })
+        .await
+        .unwrap();
 
     assert_eq!(summary.name, "media");
     assert!(summary.private);
@@ -163,6 +169,7 @@ async fn low_priority_is_refused_and_skip_applies() {
     let summary = engine
         .add(AddTorrent::Metainfo {
             bytes: single_file("media", 1024, 1024, false),
+            save_path: None,
         })
         .await
         .unwrap();
@@ -239,6 +246,7 @@ async fn stats_are_counters_not_rates() {
     engine
         .add(AddTorrent::Metainfo {
             bytes: single_file("media", 1024, 1024, false),
+            save_path: None,
         })
         .await
         .unwrap();
@@ -270,6 +278,7 @@ async fn events_reach_the_notification_stream() {
     let summary = engine
         .add(AddTorrent::Metainfo {
             bytes: single_file("media", 1024, 1024, false),
+            save_path: None,
         })
         .await
         .unwrap();
@@ -302,6 +311,7 @@ async fn detail_reports_verified_file_progress_and_downloading_state() {
     let summary = engine
         .add(AddTorrent::Metainfo {
             bytes: single_file("media", 1024, 1024, false),
+            save_path: None,
         })
         .await
         .unwrap();

@@ -146,6 +146,72 @@ async fn add_pause_resume_remove_round_trip() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn metainfo_add_parses_an_optional_save_path() -> Result<(), Box<dyn Error>> {
+    // Clients that predate `save_path` send the old shape and must keep working.
+    let legacy: flux_api::AddTorrent =
+        serde_json::from_value(json!({"kind": "metainfo", "bytes": [100, 56, 58, 97]}))?;
+    assert!(matches!(
+        legacy,
+        flux_api::AddTorrent::Metainfo {
+            save_path: None,
+            ..
+        }
+    ));
+
+    let with_path: flux_api::AddTorrent = serde_json::from_value(json!({
+        "kind": "metainfo",
+        "bytes": [100, 56, 58, 97],
+        "save_path": "D:/downloads/x",
+    }))?;
+    match with_path {
+        flux_api::AddTorrent::Metainfo { save_path, .. } => assert_eq!(
+            save_path.as_deref(),
+            Some(std::path::Path::new("D:/downloads/x"))
+        ),
+        other => return Err(format!("unexpected torrent source: {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn torrent_add_accepts_a_save_path() -> Result<(), Box<dyn Error>> {
+    let dispatcher = Dispatcher::new(Arc::new(MockEngine::new()));
+
+    let legacy = dispatcher
+        .dispatch(
+            "torrent.add",
+            Some(json!({"kind": "metainfo", "bytes": [100, 56, 58, 97]})),
+        )
+        .await?;
+    assert_eq!(legacy["state"], "queued");
+
+    let with_path = dispatcher
+        .dispatch(
+            "torrent.add",
+            Some(json!({
+                "kind": "metainfo",
+                "bytes": [100, 56, 58, 98],
+                "save_path": "D:/downloads/x",
+            })),
+        )
+        .await?;
+    assert_eq!(with_path["state"], "queued");
+    assert_ne!(with_path["id"], legacy["id"]);
+
+    // The field is optional, not a licence to accept typos.
+    assert_eq!(
+        error_code(
+            &dispatcher,
+            "torrent.add",
+            Some(json!({"kind": "metainfo", "bytes": [100], "savepath": "D:/x"})),
+        )
+        .await?,
+        codes::INVALID_PARAMS
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn metainfo_add_and_set_file_priorities() -> Result<(), Box<dyn Error>> {
     let dispatcher = Dispatcher::new(seeded()?);

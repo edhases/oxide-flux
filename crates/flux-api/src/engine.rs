@@ -185,8 +185,13 @@ pub struct Stats {
 ///
 /// ```json
 /// {"kind":"metainfo","bytes":[100,56,58,97,110,110,111,117,110,99,101]}
+/// {"kind":"metainfo","bytes":[100,56,58,97,110,110,111,117,110,99,101],"save_path":"D:/downloads/x"}
 /// {"kind":"magnet","uri":"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}
 /// ```
+///
+/// A metainfo add may name the folder its files belong in. Omitting `save_path`
+/// is the old behaviour and puts the torrent in the engine's configured
+/// download directory, so clients that predate the field keep working.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AddTorrent {
@@ -194,6 +199,10 @@ pub enum AddTorrent {
     Metainfo {
         /// Bencoded metainfo bytes.
         bytes: Vec<u8>,
+        /// Directory to download into; `None` uses the engine's configured
+        /// download directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_path: Option<std::path::PathBuf>,
     },
     /// A magnet URI.
     Magnet {
@@ -486,7 +495,7 @@ fn validate_summary(summary: &TorrentSummary) -> Result<(), EngineError> {
 
 fn source_id(source: &AddTorrent) -> Result<String, EngineError> {
     match source {
-        AddTorrent::Metainfo { bytes } => {
+        AddTorrent::Metainfo { bytes, .. } => {
             if bytes.is_empty() {
                 return Err(EngineError::InvalidSource(
                     "metainfo must not be empty".to_owned(),
@@ -620,6 +629,7 @@ mod tests {
         let engine = MockEngine::new();
         let source = AddTorrent::Metainfo {
             bytes: b"d4:infod4:name4:testee".to_vec(),
+            save_path: None,
         };
         let first = engine.add(source.clone()).await?;
         assert_eq!(first.id.len(), 16);

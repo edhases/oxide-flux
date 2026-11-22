@@ -29,6 +29,15 @@
 //!
 //! Verification runs one torrent at a time, so a batch of adds cannot spawn a
 //! hashing pool per torrent.
+//!
+//! # Where files live
+//!
+//! Every torrent owns a download root, resolved once when it is added: the
+//! caller's choice, or [`Config::download_dir`] when the caller passes none.
+//! Preallocation, verification, the swarm, streaming and file deletion all read
+//! that root, so two torrents that happen to share a name never write into each
+//! other's folders. The root is persisted per torrent only when it differs from
+//! the session default, which keeps existing state files unchanged.
 
 use std::collections::HashMap;
 use std::io;
@@ -222,6 +231,9 @@ pub struct TorrentState {
     pub private: bool,
     /// v1, v2 or hybrid.
     pub kind: TorrentKind,
+    /// Absolute root this torrent's files live under: either the folder it was
+    /// added with or the session's configured download directory.
+    pub root: PathBuf,
     /// Lifecycle state.
     pub status: Status,
     /// Hash verification progress.
@@ -300,8 +312,10 @@ pub struct PieceStateView {
 pub enum Event {
     /// A torrent finished being prepared and is now part of the session.
     Added {
-        /// Its state at registration.
-        torrent: TorrentState,
+        /// Its state at registration. Boxed because the event channel is cloned
+        /// per subscriber and a full snapshot is by far the largest thing it
+        /// carries; every queued event would otherwise reserve room for it.
+        torrent: Box<TorrentState>,
     },
     /// A torrent was removed.
     Removed {
@@ -516,7 +530,36 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
-    /// Adds a torrent from `.torrent` bytes.
+    /// Adds a torrent whose files live under `root` instead of the configured
+    /// download directory.
+    ///
+    /// `None` means [`Config::download_dir`], which is what
+    /// [`SessionHandle::add_torrent`] does. The root is resolved and created here
+    /// once, so verification, the swarm, streaming and file deletion cannot
+    /// disagree about where the bytes belong. A path that exists but is not a
+    /// directory is rejected with [`SessionError::RootNotDirectory`].
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Add`] for bad or untrustworthy metadata or a failed
+    /// allocation, [`SessionError::Duplicate`] if the id is already present,
+    /// [`SessionError::RootNotDirectory`] or [`SessionError::Io`] for an unusable
+    /// root.
+    pub async fn add_torrent_with_root(
+        &self,
+        bytes: impl Into<Vec<u8>>,
+        root: Option<PathBuf>,
+    ) -> Result<TorrentState, SessionError> {
+        self.request(|reply| Command::AddTorrent {
+            bytes: bytes.into(),
+            root,
+            reply,
+        })
+        .await
+    }
+
+    /// Adds a torrent from `.torrent` bytes into the configured download
+    /// directory.
     ///
     /// Parses the metainfo, sanitizes every path, preallocates the files and
     /// queues hash verification. Returns once the files exist; the returned state
@@ -531,11 +574,7 @@ impl SessionHandle {
         &self,
         bytes: impl Into<Vec<u8>>,
     ) -> Result<TorrentState, SessionError> {
-        self.request(|reply| Command::AddTorrent {
-            bytes: bytes.into(),
-            reply,
-        })
-        .await
+        self.add_torrent_with_root(bytes, None).await
     }
 
     /// Reads a `.torrent` file from disk and adds it. Blocking I/O runs on a
@@ -746,6 +785,12 @@ pub enum SessionError {
     /// The command channel is closed (the actor is gone).
     #[error("session has shut down")]
     Closed,
+    /// The torrent's download root names something that is not a directory.
+    #[error("download root `{}` exists but is not a directory", .path.display())]
+    RootNotDirectory {
+        /// The rejected root.
+        path: PathBuf,
+    },
     /// The actor stopped before answering.
     #[error("session actor stopped before replying")]
     ActorStopped,
@@ -814,6 +859,8 @@ enum Phase {
 
 struct Torrent {
     seq: u64,
+    /// Resolved download root: the only place this torrent's bytes may live.
+    root: PathBuf,
     plan: Arc<TorrentPlan>,
     priorities: Vec<Priority>,
     desired: PieceBitfield,
@@ -839,7 +886,7 @@ struct Torrent {
 }
 
 impl Torrent {
-    fn new(seq: u64, plan: Arc<TorrentPlan>) -> Self {
+    fn new(seq: u64, plan: Arc<TorrentPlan>, root: PathBuf) -> Self {
         let priorities = vec![Priority::Normal; plan.files().len()];
         // The priority count is built to match, and the piece limit was checked
         // while planning; an empty set is the safe fallback either way.
@@ -849,6 +896,7 @@ impl Torrent {
         let corrupt = PieceBitfield::new(plan.piece_count());
         let mut torrent = Self {
             seq,
+            root,
             plan,
             priorities,
             desired,
@@ -946,6 +994,7 @@ impl Torrent {
             name: self.plan.name().to_owned(),
             private: self.plan.private(),
             kind: self.plan.metainfo().kind(),
+            root: self.root.clone(),
             status: self.status(),
             verification: self.verification,
             total_length: self.plan.total_length(),
@@ -995,6 +1044,8 @@ struct ActiveCheck {
 enum Command {
     AddTorrent {
         bytes: Vec<u8>,
+        /// `None` keeps the session's configured download directory.
+        root: Option<PathBuf>,
         reply: Reply<TorrentState>,
     },
     Remove {
@@ -1060,7 +1111,10 @@ enum Command {
 enum Internal {
     Prepared {
         seq: u64,
-        prepared: Box<Result<TorrentPlan, AddError>>,
+        /// The root preparation actually used, so registration cannot drift from
+        /// the directory the files were created in.
+        root: PathBuf,
+        prepared: Box<Result<TorrentPlan, SessionError>>,
         reply: Reply<TorrentState>,
     },
     CheckUpdate {
@@ -1243,14 +1297,35 @@ async fn start_dht(
     }
 }
 
+/// Rejects a download root that exists but cannot hold torrent files.
+///
+/// A missing path is accepted because preparation creates it. Only a path that
+/// already names a file (or a device) is a caller error, and it is reported as
+/// such instead of surfacing later as a preallocation failure on a path that
+/// looks like the culprit.
+async fn check_root(root: &Path) -> Result<(), SessionError> {
+    let path = root.to_path_buf();
+    tokio::task::spawn_blocking(move || match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(SessionError::RootNotDirectory { path }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SessionError::Io { path, source }),
+    })
+    .await?
+}
+
 impl Session {
     async fn run(mut self) {
         let order = self.restore_order.clone();
         for id in order {
             if let Some(record) = self.restore.get(&id) {
                 let bytes = record.metainfo.clone();
+                // A record without a root was added into the session directory;
+                // one with a root must replay into exactly that directory, or the
+                // bytes it already owns would be orphaned.
+                let root = record.download_dir.as_ref().map(PathBuf::from);
                 let (reply, _dropped) = oneshot::channel();
-                self.begin_add(bytes, reply);
+                self.begin_add(bytes, root, reply);
             }
         }
 
@@ -1294,8 +1369,8 @@ impl Session {
 
     async fn handle_command(&mut self, command: Command) -> bool {
         match command {
-            Command::AddTorrent { bytes, reply } => {
-                self.begin_add(bytes, reply);
+            Command::AddTorrent { bytes, root, reply } => {
+                self.begin_add(bytes, root, reply);
                 false
             }
             Command::Remove {
@@ -1423,9 +1498,10 @@ impl Session {
         match internal {
             Internal::Prepared {
                 seq,
+                root,
                 prepared,
                 reply,
-            } => self.finish_add(seq, *prepared, reply),
+            } => self.finish_add(seq, root, *prepared, reply),
             Internal::CheckUpdate { id, epoch, update } => {
                 self.on_check_update(&id, epoch, update);
             }
@@ -1448,19 +1524,29 @@ impl Session {
         }
     }
 
-    fn begin_add(&mut self, bytes: Vec<u8>, reply: Reply<TorrentState>) {
+    fn begin_add(&mut self, bytes: Vec<u8>, root: Option<PathBuf>, reply: Reply<TorrentState>) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        let root = root.unwrap_or_else(|| self.config.download_dir.clone());
         let options = verify::PrepareOptions {
-            root: self.config.download_dir.clone(),
+            root: root.clone(),
             allocation: self.config.preallocate.allocation(),
         };
         let internal = self.internal.clone();
         tokio::spawn(async move {
-            let prepared = verify::prepare(bytes, options).await;
+            // A missing root is fine because preparation creates it; one that
+            // already names a file would only fail deep inside preallocation, where
+            // the error no longer points at the argument the caller passed.
+            let prepared = match check_root(&root).await {
+                Ok(()) => verify::prepare(bytes, options)
+                    .await
+                    .map_err(SessionError::Add),
+                Err(error) => Err(error),
+            };
             let _ = internal
                 .send(Internal::Prepared {
                     seq,
+                    root,
                     prepared: Box::new(prepared),
                     reply,
                 })
@@ -1471,13 +1557,14 @@ impl Session {
     fn finish_add(
         &mut self,
         seq: u64,
-        prepared: Result<TorrentPlan, AddError>,
+        root: PathBuf,
+        prepared: Result<TorrentPlan, SessionError>,
         reply: Reply<TorrentState>,
     ) {
         let plan = match prepared {
             Ok(plan) => Arc::new(plan),
             Err(error) => {
-                let _ = reply.send(Err(SessionError::Add(error)));
+                let _ = reply.send(Err(error));
                 return;
             }
         };
@@ -1489,7 +1576,7 @@ impl Session {
             return;
         }
 
-        let mut torrent = Torrent::new(seq, plan);
+        let mut torrent = Torrent::new(seq, plan, root);
         if !torrent.plan.verification_supported() {
             // v2-only: there are no SHA-1 hashes to check, so the torrent is
             // storage-ready but unverified. `Verification::Unsupported` says so.
@@ -1518,7 +1605,7 @@ impl Session {
         match self.state_of(&id) {
             Some(state) => {
                 self.emit(Event::Added {
-                    torrent: state.clone(),
+                    torrent: Box::new(state.clone()),
                 });
                 let _ = reply.send(Ok(state));
             }
@@ -1562,7 +1649,7 @@ impl Session {
             let _ = reply.send(Ok(()));
             return;
         }
-        let root = self.config.download_dir.clone();
+        let root = torrent.root.clone();
         let plan = Arc::clone(&torrent.plan);
         tokio::spawn(async move {
             let result =
@@ -1741,7 +1828,12 @@ impl Session {
                 metainfo: torrent.plan.raw_metainfo().to_vec(),
                 priorities,
                 paused: torrent.paused,
-                download_dir: None,
+                // The session directory is implied by where the snapshot lives, so
+                // only a torrent that lives elsewhere has to name its root. This
+                // keeps the state file of a default session byte-identical to what
+                // earlier builds wrote.
+                download_dir: (torrent.root != self.config.download_dir)
+                    .then(|| torrent.root.to_string_lossy().into_owned()),
             });
         }
         SessionSnapshot {
@@ -1784,7 +1876,6 @@ impl Session {
         let internal = self.internal.clone();
         let peer_id = self.peer_id;
         let listen_port = self.listen_port;
-        let root = self.config.download_dir.clone();
         let max_peers = self.config.max_peers_per_torrent;
         let max_upload_slots = self.config.max_upload_slots;
         let verifier_threads = self.config.verifier_threads;
@@ -1800,7 +1891,7 @@ impl Session {
             AnnounceSpec::from_metainfo(torrent.plan.metainfo(), listen_port, peer_id).ok();
         let config = SwarmConfig {
             plan: Arc::clone(&torrent.plan),
-            root,
+            root: torrent.root.clone(),
             peer_id,
             listen_port,
             initial_have: torrent.have.clone(),
@@ -1909,7 +2000,7 @@ impl Session {
             })
             .collect();
         Ok(StreamLayout {
-            root: self.config.download_dir.clone(),
+            root: torrent.root.clone(),
             piece_length,
             files,
         })
@@ -2149,7 +2240,6 @@ impl Session {
     fn start_check(&mut self, id: TorrentId) {
         let epoch = self.next_check_epoch;
         self.next_check_epoch = self.next_check_epoch.wrapping_add(1);
-        let root = self.config.download_dir.clone();
         let threads = self.config.verifier_threads;
 
         // Everything needed for the job is collected here so the mutable borrow
@@ -2168,7 +2258,7 @@ impl Session {
             match torrent.plan.piece_hashes() {
                 Some(hashes) => Some(CheckJob {
                     layout: torrent.plan.disk_layout(),
-                    root,
+                    root: torrent.root.clone(),
                     piece_length: torrent.plan.piece_length(),
                     hashes: hashes.to_vec(),
                     threads,

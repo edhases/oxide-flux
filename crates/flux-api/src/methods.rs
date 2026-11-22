@@ -184,7 +184,7 @@ fn require_id(id: String) -> Result<String, RpcError> {
 
 fn validate_add(source: &AddTorrent) -> Result<(), RpcError> {
     match source {
-        AddTorrent::Metainfo { bytes } if bytes.is_empty() => {
+        AddTorrent::Metainfo { bytes, .. } if bytes.is_empty() => {
             Err(RpcError::invalid_params("metainfo must not be empty"))
         }
         AddTorrent::Magnet { uri } if !uri.starts_with("magnet:?") => Err(

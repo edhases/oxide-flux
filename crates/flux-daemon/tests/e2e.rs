@@ -556,6 +556,226 @@ async fn a_session_survives_a_restart_with_priorities_and_pause() {
 }
 
 #[tokio::test]
+async fn adding_two_torrents_to_different_roots_keeps_files_apart() {
+    use flux_api::Engine as _;
+    use flux_daemon::engine::DaemonEngine;
+
+    let seeder_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let custom_root = tempfile::tempdir().unwrap();
+    let in_session = fixture("beta", &["b.bin"], &[24_000], 16_384);
+    let in_custom = fixture("alpha", &["a.bin"], &[40_000], 16_384);
+    in_session.write_to(session_root.path());
+    in_custom.write_to(seeder_root.path());
+
+    let seeder = SessionHandle::start(config(seeder_root.path(), free_port()))
+        .await
+        .unwrap();
+    seeder.add_torrent(in_custom.bytes.clone()).await.unwrap();
+    wait_for(&seeder, &in_custom.id, "seeder verification", |state| {
+        state.complete
+    })
+    .await;
+
+    let session = SessionHandle::start(config(session_root.path(), 0))
+        .await
+        .unwrap();
+
+    let default_state = session.add_torrent(in_session.bytes.clone()).await.unwrap();
+    assert_eq!(default_state.root, session_root.path());
+
+    let custom_state = session
+        .add_torrent_with_root(
+            in_custom.bytes.clone(),
+            Some(custom_root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(custom_state.root, custom_root.path());
+
+    // The custom-root torrent arrives over loopback: the swarm's writer and
+    // verifier must both be rooted at its own directory.
+    wait_for(&session, &in_custom.id, "custom torrent active", |state| {
+        state.active
+    })
+    .await;
+    let addr = SocketAddr::from(([127, 0, 0, 1], seeder.listen_port()));
+    session.add_peer(&in_custom.id, addr).await.unwrap();
+
+    wait_for(&session, &in_custom.id, "custom-root download", |state| {
+        state.complete
+    })
+    .await;
+    wait_for(
+        &session,
+        &in_session.id,
+        "session-root verification",
+        |state| state.complete,
+    )
+    .await;
+
+    in_session.assert_on_disk(session_root.path());
+    in_custom.assert_on_disk(custom_root.path());
+    assert!(!session_root.path().join(&in_custom.name).exists());
+    assert!(!custom_root.path().join(&in_session.name).exists());
+
+    // The detail view reports each torrent's own root, even though the engine was
+    // built with the session default.
+    let engine = DaemonEngine::new(session.clone(), session_root.path());
+    let custom_detail = engine.get(in_custom.id.as_str()).await.unwrap();
+    assert_eq!(
+        custom_detail.download_dir,
+        custom_root.path().display().to_string()
+    );
+    let default_detail = engine.get(in_session.id.as_str()).await.unwrap();
+    assert_eq!(
+        default_detail.download_dir,
+        session_root.path().display().to_string()
+    );
+
+    session.shutdown().await.unwrap();
+    seeder.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_per_torrent_root_survives_a_restart() {
+    use flux_api::Engine as _;
+    use flux_daemon::engine::DaemonEngine;
+
+    let session_root = tempfile::tempdir().unwrap();
+    let custom_root = tempfile::tempdir().unwrap();
+    let custom = fixture("show", &["episode.bin"], &[40_000], 16_384);
+    let local = fixture("local", &["notes.bin"], &[8_000], 8_000);
+    custom.write_to(custom_root.path());
+    local.write_to(session_root.path());
+
+    let mut persistent = config(session_root.path(), 0);
+    persistent.persist = true;
+
+    let first = SessionHandle::start(persistent.clone()).await.unwrap();
+    first
+        .add_torrent_with_root(custom.bytes.clone(), Some(custom_root.path().to_path_buf()))
+        .await
+        .unwrap();
+    first.add_torrent(local.bytes.clone()).await.unwrap();
+    wait_for(&first, &custom.id, "first verification", |state| {
+        state.complete
+    })
+    .await;
+    wait_for(&first, &local.id, "local verification", |state| {
+        state.complete
+    })
+    .await;
+    first.shutdown().await.unwrap();
+
+    // Only the torrent that left the session directory records a root; the other
+    // keeps the state file of a default session unchanged.
+    let state_path = session_root.path().join(".fluxd-state.json");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let records = snapshot["torrents"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0]["download_dir"].as_str(),
+        Some(custom_root.path().display().to_string().as_str())
+    );
+    assert!(
+        records[1]["download_dir"].is_null(),
+        "a default-root torrent must not record a path: {text}"
+    );
+
+    let second = SessionHandle::start(persistent).await.unwrap();
+    let restored = wait_for(&second, &custom.id, "restore", |state| state.complete).await;
+    assert_eq!(
+        restored.root,
+        custom_root.path(),
+        "the restored torrent must replay into its recorded root"
+    );
+    let local_restored =
+        wait_for(&second, &local.id, "local restore", |state| state.complete).await;
+    assert_eq!(local_restored.root, session_root.path());
+
+    let engine = DaemonEngine::new(second.clone(), session_root.path());
+    let detail = engine.get(custom.id.as_str()).await.unwrap();
+    assert_eq!(
+        detail.download_dir,
+        custom_root.path().display().to_string()
+    );
+    // Restoring must not have prepared a second copy under the session directory.
+    assert!(!session_root.path().join(&custom.name).exists());
+
+    second.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delete_files_uses_the_torrent_root() {
+    let session_root = tempfile::tempdir().unwrap();
+    let custom_root = tempfile::tempdir().unwrap();
+    let torrent = fixture("movie", &["one.bin"], &[1_000], 1_000);
+    torrent.write_to(custom_root.path());
+    // Bystanders: one beside the torrent inside the custom root, one in the
+    // session directory.
+    let neighbour = custom_root.path().join("keep.txt");
+    std::fs::write(&neighbour, b"keep").unwrap();
+    let other = session_root.path().join("keep.txt");
+    std::fs::write(&other, b"keep").unwrap();
+
+    let session = SessionHandle::start(config(session_root.path(), 0))
+        .await
+        .unwrap();
+    session
+        .add_torrent_with_root(
+            torrent.bytes.clone(),
+            Some(custom_root.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    wait_for(&session, &torrent.id, "verification", |state| {
+        state.complete
+    })
+    .await;
+    let owned = custom_root.path().join(&torrent.name).join("one.bin");
+    assert!(owned.exists());
+
+    session.remove(&torrent.id, true).await.unwrap();
+    assert!(
+        !owned.exists(),
+        "deletion must remove the torrent's own files"
+    );
+    assert!(
+        neighbour.exists(),
+        "files beside the torrent must survive deletion"
+    );
+    assert!(other.exists(), "the session directory must be untouched");
+
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_root_that_is_a_file_is_refused_before_any_write() {
+    let session_root = tempfile::tempdir().unwrap();
+    let not_a_dir = session_root.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"already here").unwrap();
+    let torrent = fixture("movie", &["one.bin"], &[1_000], 1_000);
+
+    let session = SessionHandle::start(config(session_root.path(), 0))
+        .await
+        .unwrap();
+    let error = session
+        .add_torrent_with_root(torrent.bytes, Some(not_a_dir.clone()))
+        .await
+        .expect_err("a file is not a download root");
+    assert!(
+        matches!(error, flux_daemon::SessionError::RootNotDirectory { .. }),
+        "{error}"
+    );
+    assert!(session.list().await.unwrap().is_empty());
+    assert_eq!(std::fs::read(&not_a_dir).unwrap(), b"already here");
+
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_v2_only_torrent_is_storage_ready_but_never_pretends_to_download() {
     // Build a v2-only torrent: no SHA-1 pieces, so the engine cannot verify it.
     let tree = dict(vec![(
