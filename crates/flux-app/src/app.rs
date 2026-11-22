@@ -2984,18 +2984,8 @@ pub fn format_duration(seconds: u64) -> String {
 }
 
 fn default_config() -> Config {
-    if let Some(path) = std::env::var_os("OXIDE_FLUX_DOWNLOAD_DIR") {
-        return Config {
-            download_dir: PathBuf::from(path),
-            ..Config::default()
-        };
-    }
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     Config {
-        download_dir: home.join("Downloads").join("OxideFlux"),
+        download_dir: crate::launch::default_download_dir(),
         ..Config::default()
     }
 }

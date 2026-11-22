@@ -310,7 +310,7 @@ impl Default for SettingsState {
             .display()
             .to_string();
 
-        let default_download_path = DaemonConfig::default().download_dir.display().to_string();
+        let default_download_path = crate::launch::default_download_dir().display().to_string();
 
         let installed = playback::installed_version();
         let bundled = playback::bundled_mpv();
@@ -456,7 +456,8 @@ impl SettingsState {
             },
         };
 
-        daemon.download_dir = PathBuf::from(self.default_download_path.trim());
+        daemon.download_dir =
+            crate::launch::resolve_download_dir(&self.default_download_path, &daemon.download_dir);
         daemon.preallocate = self.preallocate.into();
         daemon.max_active_downloads = self.max_active_downloads;
         daemon.max_active_seeds = self.max_active_seeds;
@@ -471,7 +472,16 @@ impl SettingsState {
     /// Checks whether any modified setting requires an in-process engine restart.
     #[must_use]
     pub fn requires_restart(&self, daemon: &DaemonConfig) -> bool {
-        daemon.download_dir.as_os_str() != self.default_download_path.trim()
+        let wanted_dir =
+            crate::launch::resolve_download_dir(&self.default_download_path, &daemon.download_dir);
+        // Compare like with like: a hand-written `downloads` in a config means
+        // the same folder as the absolute form anchored at home.
+        let current_dir = if daemon.download_dir.is_absolute() {
+            daemon.download_dir.clone()
+        } else {
+            crate::launch::home_dir().join(&daemon.download_dir)
+        };
+        current_dir != wanted_dir
             || daemon.max_active_downloads != self.max_active_downloads
             || daemon.max_active_seeds != self.max_active_seeds
             || daemon.preallocate != Preallocate::from(self.preallocate)

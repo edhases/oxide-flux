@@ -216,6 +216,48 @@ pub fn config_dir() -> PathBuf {
         })
 }
 
+/// The user's default download folder: `~/Downloads/OxideFlux`, or whatever
+/// `OXIDE_FLUX_DOWNLOAD_DIR` says.
+///
+/// It is absolute on purpose. A relative fallback (`downloads`) would resolve
+/// against the process working directory, which for a client started from a
+/// repository or a shortcut is not where anyone expects their media to land.
+#[must_use]
+pub fn default_download_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("OXIDE_FLUX_DOWNLOAD_DIR") {
+        return PathBuf::from(path);
+    }
+    home_dir().join("Downloads").join("OxideFlux")
+}
+
+/// `%USERPROFILE%`/`$HOME`, falling back to the working directory.
+#[must_use]
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolves a folder typed into the settings dialog or saved in `settings.json`.
+///
+/// Empty input keeps `fallback`; a relative path is anchored at the home
+/// directory so a session never writes into whatever the working directory
+/// happens to be.
+#[must_use]
+pub fn resolve_download_dir(raw: &str, fallback: &std::path::Path) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return fallback.to_path_buf();
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        home_dir().join(path)
+    }
+}
+
 fn parse_target(target: &str) -> Result<OpenRequest, String> {
     if target.to_ascii_lowercase().starts_with("magnet:") {
         return Ok(OpenRequest::Magnet(target.to_owned()));
@@ -431,6 +473,18 @@ mod tests {
         assert_eq!(loaded.ui.default_download_path, "F:/downloads");
         assert_eq!(loaded.ui.max_peers, 77);
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn a_relative_download_folder_is_anchored_at_home() {
+        let fallback = Path::new("F:/fallback");
+        assert_eq!(resolve_download_dir("   ", fallback), fallback);
+        let resolved = resolve_download_dir("downloads", fallback);
+        assert!(
+            resolved.is_absolute(),
+            "a relative folder must not resolve against the working directory"
+        );
+        assert!(resolved.ends_with("downloads"));
     }
 
     #[test]
