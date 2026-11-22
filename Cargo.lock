@@ -1282,7 +1282,7 @@ checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
 name = "flux-api"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "flux-app"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "clipboard-win",
  "flux-api",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "flux-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "flux-daemon"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fastrand",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "flux-disk"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "sha1 0.10.7",
  "tempfile",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "flux-net"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "fastrand",
  "flux-core",
