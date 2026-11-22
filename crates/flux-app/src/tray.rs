@@ -289,6 +289,10 @@ mod imp {
             None
         }
     }
+
+    /// There is no tray on other platforms, so there is nothing to bring
+    /// forward; the iced window keeps its own focus handling.
+    pub fn show_and_focus(_hwnd_isize: isize) {}
 }
 
 #[cfg(not(windows))]

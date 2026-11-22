@@ -4,3 +4,6 @@
 /dist
 /stage
 
+
+# The debug app's default download folder when started from the repository.
+downloads/
