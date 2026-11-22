@@ -3041,7 +3041,10 @@ mod tests {
             Some(PathBuf::from("C:/downloads/Show/e01.mkv"))
         );
         assert_eq!(safe_join(root, Path::new("../secret")), None);
-        assert_eq!(safe_join(root, Path::new("C:/windows/system32")), None);
+        // Only Windows parses `C:/...` as a rooted path; on Unix it is an
+        // ordinary relative name and joining it stays inside the folder.
+        #[cfg(windows)]
+        assert_eq!(safe_join(root, Path::new("D:/windows/system32")), None);
     }
 
     #[test]

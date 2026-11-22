@@ -1485,9 +1485,11 @@ impl Session {
                 for handle in handles {
                     handle.shutdown().await;
                 }
-                if self.persist_pending {
-                    self.persist_now().await;
-                }
+                // Always write on shutdown, never only when something is
+                // pending: a save started by the latest tick may still be
+                // writing an older snapshot, and `persist_now` is what waits
+                // for it before the final state lands.
+                self.persist_now().await;
                 let _ = reply.send(Ok(()));
                 true
             }
