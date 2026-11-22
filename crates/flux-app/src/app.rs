@@ -223,6 +223,8 @@ struct AddDraft {
     bytes: Vec<u8>,
     name: String,
     size: u64,
+    /// Torrent-relative files, used to see what is already on disk.
+    files: Vec<(PathBuf, u64)>,
     /// Editable save folder; starts at the default download directory.
     path: String,
     /// Free bytes on the drive that currently holds `path`, when measurable.
@@ -231,13 +233,49 @@ struct AddDraft {
 }
 
 impl AddDraft {
-    /// Whether the torrent cannot fit on the selected drive.
+    /// Bytes still missing under the chosen folder.
+    ///
+    /// Data downloaded earlier (by this app, or by any client sharing the
+    /// folder) still has to be verified, but it does not need free space again.
+    fn missing_bytes(&self) -> u64 {
+        let root = Path::new(self.path.trim());
+        let present: u64 = self
+            .files
+            .iter()
+            .map(|(relative, length)| {
+                let path = safe_join(root, relative);
+                match path.and_then(|path| std::fs::metadata(path).ok()) {
+                    Some(meta) if meta.is_file() => meta.len().min(*length),
+                    _ => 0,
+                }
+            })
+            .sum();
+        self.size.saturating_sub(present)
+    }
+
+    /// Whether the missing bytes cannot fit on the selected drive.
     ///
     /// Preallocation would otherwise start and die halfway through with a bare
     /// `os error 112`, which is exactly how a 96 GB torrent fills a 66 GB disk.
     fn lacks_space(&self) -> bool {
-        self.free.is_some_and(|free| self.size > free)
+        self.free.is_some_and(|free| self.missing_bytes() > free)
     }
+}
+
+/// Joins torrent-relative components onto `root`, refusing anything that could
+/// escape it.
+///
+/// The metainfo is attacker-controlled: this only measures sizes, but reading
+/// through `..` would still disclose whether arbitrary files exist.
+fn safe_join(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => path.push(part),
+            _ => return None,
+        }
+    }
+    Some(path)
 }
 
 /// UI messages.
@@ -1037,9 +1075,23 @@ impl App {
             Ok(metainfo) => {
                 let path = self.download_dir.display().to_string();
                 let free = free_space(Path::new(&path));
+                let size = metainfo.info.layout.total_length();
+                let files = metainfo
+                    .info
+                    .layout
+                    .files()
+                    .iter()
+                    .map(|file| {
+                        (
+                            PathBuf::from_iter(file.path.iter().map(String::as_str)),
+                            file.length,
+                        )
+                    })
+                    .collect();
                 self.add_draft = Some(AddDraft {
                     name: metainfo.info.name.clone(),
-                    size: metainfo.info.layout.total_length(),
+                    size,
+                    files,
                     path,
                     free,
                     bytes,
@@ -1167,11 +1219,20 @@ impl App {
                 .wrapping(Wrapping::Word),
             None if draft.lacks_space() => text(format!(
                 "Not enough space: needs {}, only {} free there. Pick another folder.",
-                format_bytes(draft.size),
+                format_bytes(draft.missing_bytes()),
                 format_bytes(draft.free.unwrap_or(0))
             ))
             .size(CAPTION)
             .color(T.danger)
+            .width(Fill)
+            .wrapping(Wrapping::Word),
+            None if draft.missing_bytes() < draft.size => text(format!(
+                "{} of {} already in that folder; it will be verified, not downloaded again.",
+                format_bytes(draft.size - draft.missing_bytes()),
+                format_bytes(draft.size)
+            ))
+            .size(CAPTION)
+            .color(T.text_secondary)
             .width(Fill)
             .wrapping(Wrapping::Word),
             None => text("The folder is created if it does not exist.")
@@ -2947,11 +3008,49 @@ mod tests {
     }
 
     #[test]
+    fn data_already_on_disk_does_not_need_free_space_again() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Show")).unwrap();
+        std::fs::write(dir.path().join("Show").join("e01.mkv"), vec![0u8; 40]).unwrap();
+
+        let draft = AddDraft {
+            bytes: Vec::new(),
+            name: "Show".to_owned(),
+            size: 100,
+            files: vec![(PathBuf::from("Show").join("e01.mkv"), 100)],
+            path: dir.path().display().to_string(),
+            free: Some(70),
+            error: None,
+        };
+        // 40 of 100 bytes are already there, so only 60 need room.
+        assert_eq!(draft.missing_bytes(), 60);
+        assert!(!draft.lacks_space());
+
+        let tight = AddDraft {
+            free: Some(59),
+            ..draft
+        };
+        assert!(tight.lacks_space());
+    }
+
+    #[test]
+    fn a_hostile_path_never_escapes_the_save_folder() {
+        let root = Path::new("C:/downloads");
+        assert_eq!(
+            safe_join(root, Path::new("Show/e01.mkv")),
+            Some(PathBuf::from("C:/downloads/Show/e01.mkv"))
+        );
+        assert_eq!(safe_join(root, Path::new("../secret")), None);
+        assert_eq!(safe_join(root, Path::new("C:/windows/system32")), None);
+    }
+
+    #[test]
     fn a_torrent_larger_than_the_free_space_is_refused() {
         let draft = |size: u64, free: Option<u64>| AddDraft {
             bytes: Vec::new(),
             name: "x".to_owned(),
             size,
+            files: Vec::new(),
             path: String::new(),
             free,
             error: None,
