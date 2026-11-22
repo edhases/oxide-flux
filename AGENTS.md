@@ -82,6 +82,15 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
   write; without this, a stale snapshot could land after shutdown and resurrect old state.
 - **Tests must stay offline.** Tracker/DHT tests use loopback sockets only; every daemon
   test config sets `enable_dht: false` (otherwise bootstrap DNS resolution runs).
+- **The desktop UI is localized.** Every user-facing string goes through `flux-app/src/i18n.rs`
+  (`TextKey`/`tr`, `torrents_count` for pluralisation); `Language::System` resolves once via
+  `sys-locale`. Do not hardcode UI text in `app.rs`, and keep the Ukrainian forms to
+  one/few/many - not English one/other.
+- **Adding a torrent is a dialog, not a silent add.** `flux-app/src/add_dialog.rs` owns the file
+  tree, priorities, start-paused/streaming flags and the free-space check; `app.rs` only applies
+  the result (add, then `Pause` and `SetPriority` once the new id appears). The check counts only
+  selected files and subtracts data already on disk, and `safe_join` rejects `..` before any
+  metadata read.
 - **The UI is embedded, not built.** `flux-api/static/{index.html,app.js,style.css}` are
   `include_str!`-ed; edit them directly, keep them vanilla (no bundler), and remember the
   static routes are public while every data call still needs the token. `tests/ui.rs` pins

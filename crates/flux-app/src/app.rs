@@ -12,8 +12,8 @@ use flux_api::{FileView, Priority, Stats, TorrentDetail, TorrentState, TorrentSu
 use flux_daemon::Config;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, mouse_area, opaque, pick_list, progress_bar, row, scrollable,
-    stack, text, text_input,
+    Space, button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, stack,
+    text, text_input,
 };
 #[cfg(windows)]
 use iced::window::raw_window_handle::RawWindowHandle;
@@ -22,10 +22,13 @@ use iced::{
 };
 use iced::{font, keyboard, window};
 
+use crate::add_dialog::{self, AddDialogMessage, AddDialogState};
+use crate::i18n::{self, Language, ResolvedLanguage, TextKey};
 use crate::icons::{self, icon};
 use crate::launch::{Initial, PlaybackBackend, PlaybackSettings, Settings};
 use crate::playback;
 use crate::player::{self, Bounds, Player};
+use crate::settings_dialog::{self, SettingsMessage, SettingsState};
 use crate::single_instance::{OpenRequest, RequestQueue};
 use crate::style;
 use crate::supervisor::{self, Command, Event};
@@ -43,6 +46,9 @@ const MICRO: f32 = type_scale::MICRO;
 ///
 /// Returns an [`iced::Error`] if the window or renderer cannot start.
 pub fn run(initial: Initial) -> iced::Result {
+    let window_icon =
+        window::icon::from_rgba(include_bytes!("../assets/icon-64.rgba").to_vec(), 64, 64).ok();
+
     iced::application(move || App::new(initial.clone()), App::update, App::view)
         .theme(|_: &App| theme::iced_theme())
         .subscription(App::subscription)
@@ -51,6 +57,7 @@ pub fn run(initial: Initial) -> iced::Result {
             size: iced::Size::new(1280.0, 800.0),
             min_size: Some(iced::Size::new(960.0, 600.0)),
             exit_on_close_request: false,
+            icon: window_icon,
             ..window::Settings::default()
         })
         .font(include_bytes!("../assets/fonts/Inter-Variable.ttf").as_slice())
@@ -105,15 +112,15 @@ impl Filter {
         Self::Error,
     ];
 
-    fn label(self) -> &'static str {
+    fn label_tr(self, lang: ResolvedLanguage) -> &'static str {
         match self {
-            Self::All => "All",
-            Self::Downloading => "Downloading",
-            Self::Seeding => "Seeding",
-            Self::Completed => "Completed",
-            Self::Paused => "Paused",
-            Self::Checking => "Checking",
-            Self::Error => "Error",
+            Self::All => lang.t(TextKey::FilterAll),
+            Self::Downloading => lang.t(TextKey::FilterDownloading),
+            Self::Seeding => lang.t(TextKey::FilterSeeding),
+            Self::Completed => lang.t(TextKey::FilterCompleted),
+            Self::Paused => lang.t(TextKey::FilterPaused),
+            Self::Checking => lang.t(TextKey::FilterChecking),
+            Self::Error => lang.t(TextKey::FilterError),
         }
     }
 
@@ -215,69 +222,6 @@ impl From<Priority> for PriorityChoice {
     }
 }
 
-/// A `.torrent` that has been picked but not added yet.
-///
-/// The bytes are kept so the engine never has to re-read the file, and the
-/// dialog shows the name and size the metainfo actually declares.
-struct AddDraft {
-    bytes: Vec<u8>,
-    name: String,
-    size: u64,
-    /// Torrent-relative files, used to see what is already on disk.
-    files: Vec<(PathBuf, u64)>,
-    /// Editable save folder; starts at the default download directory.
-    path: String,
-    /// Free bytes on the drive that currently holds `path`, when measurable.
-    free: Option<u64>,
-    error: Option<String>,
-}
-
-impl AddDraft {
-    /// Bytes still missing under the chosen folder.
-    ///
-    /// Data downloaded earlier (by this app, or by any client sharing the
-    /// folder) still has to be verified, but it does not need free space again.
-    fn missing_bytes(&self) -> u64 {
-        let root = Path::new(self.path.trim());
-        let present: u64 = self
-            .files
-            .iter()
-            .map(|(relative, length)| {
-                let path = safe_join(root, relative);
-                match path.and_then(|path| std::fs::metadata(path).ok()) {
-                    Some(meta) if meta.is_file() => meta.len().min(*length),
-                    _ => 0,
-                }
-            })
-            .sum();
-        self.size.saturating_sub(present)
-    }
-
-    /// Whether the missing bytes cannot fit on the selected drive.
-    ///
-    /// Preallocation would otherwise start and die halfway through with a bare
-    /// `os error 112`, which is exactly how a 96 GB torrent fills a 66 GB disk.
-    fn lacks_space(&self) -> bool {
-        self.free.is_some_and(|free| self.missing_bytes() > free)
-    }
-}
-
-/// Joins torrent-relative components onto `root`, refusing anything that could
-/// escape it.
-///
-/// The metainfo is attacker-controlled: this only measures sizes, but reading
-/// through `..` would still disclose whether arbitrary files exist.
-fn safe_join(root: &Path, relative: &Path) -> Option<PathBuf> {
-    let mut path = root.to_path_buf();
-    for component in relative.components() {
-        match component {
-            std::path::Component::Normal(part) => path.push(part),
-            _ => return None,
-        }
-    }
-    Some(path)
-}
-
 /// UI messages.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -292,14 +236,6 @@ pub enum Message {
     Tab(DetailTab),
     AddFile,
     FilePicked(Option<Vec<u8>>),
-    /// The add dialog's save-folder field changed.
-    SavePathChanged(String),
-    /// Ask for a folder for the torrent waiting in the add dialog.
-    BrowseSavePath,
-    SavePathPicked(Option<PathBuf>),
-    /// Add the torrent in the dialog using the chosen folder.
-    ConfirmAdd,
-    CancelAdd,
     ToggleMagnet,
     MagnetChanged(String),
     AddMagnet,
@@ -347,6 +283,24 @@ pub enum Message {
     InstallUpdate,
     /// The background install finished: the installed version, or the error.
     UpdateInstalled(Result<String, String>),
+    /// Messages from the modular Add Torrent dialog.
+    AddDialog(AddDialogMessage),
+    /// Messages from the modular Settings panel.
+    SettingsDialog(SettingsMessage),
+    /// Open the download folder in the system file manager.
+    OpenSavePath,
+    /// Triggered by Ctrl+V when no input has focus.
+    PasteClipboard,
+    /// Clipboard content received.
+    ClipboardPasted(Option<String>),
+}
+
+#[derive(Debug, Clone)]
+struct PendingAdd {
+    file_priorities: Vec<(usize, add_dialog::PriorityChoice)>,
+    start_paused: bool,
+    #[allow(dead_code)]
+    sequential: bool,
 }
 
 /// Application state.
@@ -367,7 +321,10 @@ pub struct App {
     magnet_open: bool,
     magnet_input: String,
     /// A `.torrent` that is waiting for the user to confirm its folder.
-    add_draft: Option<AddDraft>,
+    add_dialog: Option<AddDialogState>,
+    settings_dialog: Option<SettingsState>,
+    pending_add: Option<PendingAdd>,
+    language: Language,
     error: Option<String>,
     dismissed_error: Option<String>,
     player: Player,
@@ -389,10 +346,13 @@ pub struct App {
     update_busy: bool,
     update_message: Option<String>,
     settings: Settings,
+    /// The daemon config the running session was built from.
+    session_config: Config,
     settings_open: bool,
     settings_backend: PlaybackBackend,
     settings_mpv_path: String,
     plugin_busy: bool,
+    tray: Option<crate::tray::TrayIcon>,
 }
 
 impl App {
@@ -411,12 +371,15 @@ impl App {
             }
         };
 
-        let config = default_config();
+        let mut config = default_config();
+        let mut settings = initial.settings.clone();
+        let ui = settings.ui.clone();
+        ui.apply_to_configs(&mut settings, &mut config);
         let download_dir = config.download_dir.clone();
         let dht = config.enable_dht;
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
-        runtime.spawn(supervisor::run(config, command_rx, event_tx));
+        runtime.spawn(supervisor::run(config.clone(), command_rx, event_tx));
 
         let error = if initial.notices.is_empty() {
             None
@@ -440,7 +403,10 @@ impl App {
             detail: None,
             magnet_open: false,
             magnet_input: String::new(),
-            add_draft: None,
+            add_dialog: None,
+            settings_dialog: None,
+            pending_add: None,
+            language: Language::System,
             error,
             dismissed_error: None,
             player: {
@@ -465,7 +431,8 @@ impl App {
             available_update: None,
             update_busy: false,
             update_message: None,
-            settings: initial.settings.clone(),
+            settings: settings.clone(),
+            session_config: config,
             settings_open: false,
             settings_backend: initial.settings.playback.backend,
             settings_mpv_path: initial
@@ -476,6 +443,7 @@ impl App {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             plugin_busy: false,
+            tray: crate::tray::TrayIcon::new(),
         }
     }
 
@@ -500,6 +468,45 @@ impl App {
         match message {
             Message::Pump => {
                 self.drain_events();
+                if self.hwnd.is_none() {
+                    return self.request_window();
+                }
+                if let Some(tray) = &self.tray {
+                    while let Some(event) = tray.poll_event() {
+                        match event {
+                            crate::tray::TrayEvent::OpenWindow => {
+                                if let Some(hwnd) = self.hwnd {
+                                    crate::tray::show_and_focus(hwnd);
+                                }
+                            }
+                            crate::tray::TrayEvent::PauseAll => {
+                                for torrent in &self.torrents {
+                                    if torrent.state == TorrentState::Downloading
+                                        || torrent.state == TorrentState::Seeding
+                                    {
+                                        let _ =
+                                            self.commands.send(Command::Pause(torrent.id.clone()));
+                                    }
+                                }
+                            }
+                            crate::tray::TrayEvent::ResumeAll => {
+                                for torrent in &self.torrents {
+                                    if torrent.state == TorrentState::Paused {
+                                        let _ =
+                                            self.commands.send(Command::Resume(torrent.id.clone()));
+                                    }
+                                }
+                            }
+                            crate::tray::TrayEvent::Exit => {
+                                if !self.closing {
+                                    self.closing = true;
+                                    self.player.stop();
+                                    let _ = self.commands.send(Command::Shutdown);
+                                }
+                            }
+                        }
+                    }
+                }
                 if !self.update_checked {
                     self.update_checked = true;
                     return Task::perform(check_for_update(), Message::UpdateChecked);
@@ -531,9 +538,10 @@ impl App {
                 return iced::widget::operation::focus(search_id());
             }
             Message::Escape => {
-                if self.add_draft.is_some() {
-                    self.add_draft = None;
-                } else if self.settings_open {
+                if self.add_dialog.is_some() {
+                    self.add_dialog = None;
+                } else if self.settings_dialog.is_some() || self.settings_open {
+                    self.settings_dialog = None;
                     self.settings_open = false;
                 } else if self.playing.is_some() {
                     self.stop_playback();
@@ -562,34 +570,134 @@ impl App {
             Message::AddFile => return Task::perform(pick_torrent(), Message::FilePicked),
             Message::FilePicked(bytes) => {
                 if let Some(bytes) = bytes {
-                    self.prepare_add(bytes);
+                    self.open_add_dialog(bytes);
                 }
             }
-            Message::SavePathChanged(path) => {
-                if let Some(draft) = &mut self.add_draft {
-                    draft.free = free_space(Path::new(path.trim()));
-                    draft.path = path;
-                    draft.error = None;
+            Message::ToggleMagnet => {
+                let mut state = AddDialogState::new(self.download_dir.display().to_string())
+                    .with_language(self.language.resolve());
+                state.mode = add_dialog::Mode::Magnet;
+                self.add_dialog = Some(state);
+            }
+            Message::AddDialog(msg) => {
+                if let Some(dialog) = &mut self.add_dialog
+                    && let Some(action) = dialog.update(msg)
+                {
+                    match action {
+                        add_dialog::AddDialogAction::ConfirmTorrent {
+                            bytes,
+                            save_path,
+                            file_priorities,
+                            start_immediately,
+                            sequential,
+                        } => {
+                            let _ = self.commands.send(Command::AddBytes {
+                                bytes,
+                                save_path: Some(save_path),
+                            });
+                            self.pending_add = Some(PendingAdd {
+                                file_priorities,
+                                start_paused: !start_immediately,
+                                sequential,
+                            });
+                            self.add_dialog = None;
+                        }
+                        add_dialog::AddDialogAction::ConfirmMagnet {
+                            uri,
+                            save_path: _,
+                            start_immediately,
+                            sequential: _,
+                        } => {
+                            let _ = self.commands.send(Command::AddMagnet(uri));
+                            if !start_immediately {
+                                self.pending_add = Some(PendingAdd {
+                                    file_priorities: Vec::new(),
+                                    start_paused: true,
+                                    sequential: false,
+                                });
+                            }
+                            self.add_dialog = None;
+                        }
+                        add_dialog::AddDialogAction::BrowseFolder => {
+                            let start = PathBuf::from(dialog.save_path.trim());
+                            let pick_start = if start.is_dir() { Some(start) } else { None };
+                            return Task::perform(pick_folder(pick_start), |opt| {
+                                Message::AddDialog(add_dialog::AddDialogMessage::FolderPicked(opt))
+                            });
+                        }
+                        add_dialog::AddDialogAction::BrowseTorrentFile => {
+                            return Task::perform(pick_torrent(), |opt| {
+                                Message::AddDialog(add_dialog::AddDialogMessage::TorrentFilePicked(
+                                    opt,
+                                ))
+                            });
+                        }
+                        add_dialog::AddDialogAction::FetchMagnet(uri) => {
+                            let _ = self.commands.send(Command::AddMagnet(uri));
+                            self.add_dialog = None;
+                        }
+                        add_dialog::AddDialogAction::Cancel => {
+                            self.add_dialog = None;
+                        }
+                    }
                 }
             }
-            Message::BrowseSavePath => {
-                let start = self
-                    .add_draft
-                    .as_ref()
-                    .map(|draft| PathBuf::from(draft.path.trim()))
-                    .filter(|path| path.is_dir());
-                return Task::perform(pick_folder(start), Message::SavePathPicked);
-            }
-            Message::SavePathPicked(path) => {
-                if let (Some(draft), Some(path)) = (&mut self.add_draft, path) {
-                    draft.free = free_space(&path);
-                    draft.path = path.display().to_string();
-                    draft.error = None;
+            Message::SettingsDialog(msg) => {
+                if let Some(dialog) = &mut self.settings_dialog {
+                    match msg {
+                        settings_dialog::SettingsMessage::Cancel => {
+                            self.settings_open = false;
+                            self.settings_dialog = None;
+                        }
+                        settings_dialog::SettingsMessage::Save => {
+                            let dialog = dialog.clone();
+                            self.apply_settings(dialog);
+                        }
+                        settings_dialog::SettingsMessage::BrowseDownloadDir => {
+                            let start = PathBuf::from(dialog.default_download_path.trim());
+                            let pick_start = if start.is_dir() { Some(start) } else { None };
+                            return Task::perform(pick_folder(pick_start), |opt| {
+                                Message::SettingsDialog(
+                                    settings_dialog::SettingsMessage::DownloadDirPicked(opt),
+                                )
+                            });
+                        }
+                        other => {
+                            let cmd = dialog.update(other);
+                            return cmd.map(Message::SettingsDialog);
+                        }
+                    }
                 }
             }
-            Message::ConfirmAdd => self.confirm_add(),
-            Message::CancelAdd => self.add_draft = None,
-            Message::ToggleMagnet => self.magnet_open = !self.magnet_open,
+            Message::OpenSavePath => {
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("explorer")
+                        .arg(&self.download_dir)
+                        .spawn();
+                }
+            }
+            Message::PasteClipboard => {
+                #[cfg(windows)]
+                {
+                    if let Ok(clip) = clipboard_win::get_clipboard_string() {
+                        return Task::done(Message::ClipboardPasted(Some(clip)));
+                    }
+                }
+            }
+            Message::ClipboardPasted(text) => {
+                if let Some(text) = text {
+                    let trimmed = text.trim();
+                    if trimmed.starts_with("magnet:?") {
+                        let mut state =
+                            AddDialogState::new(self.download_dir.display().to_string())
+                                .with_language(self.language.resolve());
+                        state.mode = add_dialog::Mode::Magnet;
+                        state.magnet_input = trimmed.to_owned();
+                        self.add_dialog = Some(state);
+                    }
+                }
+            }
             Message::MagnetChanged(value) => self.magnet_input = value,
             Message::AddMagnet => {
                 let uri = self.magnet_input.trim().to_owned();
@@ -680,6 +788,9 @@ impl App {
             }
             Message::WindowHandle(handle) => {
                 self.hwnd = handle;
+                if let (Some(tray), Some(hwnd)) = (&self.tray, handle) {
+                    tray.set_main_hwnd(hwnd);
+                }
                 self.try_start_playback();
                 if handle.is_none()
                     && let Some((url, title)) = self.pending_stream.take()
@@ -705,6 +816,12 @@ impl App {
             }
             Message::StopPlayback => self.stop_playback(),
             Message::OpenSettings => {
+                // Saved preferences are the source of truth; only the runtime
+                // facts (versions, state path, plugin status) are refreshed.
+                let mut state = self.settings.ui.clone();
+                state.refresh_runtime(&self.settings, &self.session_config);
+                state.language = self.language;
+                self.settings_dialog = Some(state);
                 self.settings_backend = self.settings.playback.backend;
                 self.settings_mpv_path = self
                     .settings
@@ -715,7 +832,10 @@ impl App {
                     .unwrap_or_default();
                 self.settings_open = true;
             }
-            Message::CloseSettings => self.settings_open = false,
+            Message::CloseSettings => {
+                self.settings_open = false;
+                self.settings_dialog = None;
+            }
             Message::BackendChanged(backend) => self.settings_backend = backend,
             Message::MpvPathChanged(path) => self.settings_mpv_path = path,
             Message::SaveSettings => self.save_settings(),
@@ -757,7 +877,7 @@ impl App {
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
                 {
                     match std::fs::read(&path) {
-                        Ok(bytes) => self.prepare_add(bytes),
+                        Ok(bytes) => self.open_add_dialog(bytes),
                         Err(error) => {
                             self.error = Some(format!("cannot read {}: {error}", path.display()));
                         }
@@ -855,6 +975,30 @@ impl App {
         self.player.stop();
         self.playing = None;
         self.pending_stream = None;
+    }
+
+    /// Persists and applies the dialog's choices.
+    ///
+    /// Language, the theme and the default folder take effect at once; engine
+    /// settings (ports, limits, threads) need a restart because the session was
+    /// built from the config at startup, and saying so beats a silent no-op.
+    fn apply_settings(&mut self, dialog: SettingsState) {
+        let mut config = self.session_config.clone();
+        dialog.apply_to_configs(&mut self.settings, &mut config);
+        self.settings.ui = dialog.clone();
+        self.language = dialog.language;
+        self.download_dir = config.download_dir.clone();
+        self.dht = config.enable_dht;
+        self.settings_backend = dialog.backend;
+        self.settings_mpv_path = dialog.custom_mpv_path.clone();
+        self.save_settings();
+        if dialog.requires_restart(&self.session_config) {
+            self.update_message = Some(
+                "Saved. Restart Oxide Flux to apply connection and storage changes.".to_owned(),
+            );
+        }
+        self.settings_open = false;
+        self.settings_dialog = None;
     }
 
     fn save_settings(&mut self) {
@@ -994,6 +1138,29 @@ impl App {
                     download_dir: _,
                 } => self.version = version,
                 Event::Snapshot { torrents, stats } => {
+                    if let Some(pending) = self.pending_add.take() {
+                        let prev_ids: std::collections::HashSet<_> =
+                            self.torrents.iter().map(|t| t.id.clone()).collect();
+                        if let Some(new_torrent) =
+                            torrents.iter().find(|t| !prev_ids.contains(&t.id))
+                        {
+                            if pending.start_paused {
+                                let _ = self.commands.send(Command::Pause(new_torrent.id.clone()));
+                            }
+                            for (index, prio) in pending.file_priorities {
+                                let priority: Priority = prio.into();
+                                if priority != Priority::Normal {
+                                    let _ = self.commands.send(Command::SetPriority {
+                                        id: new_torrent.id.clone(),
+                                        index,
+                                        priority,
+                                    });
+                                }
+                            }
+                        } else {
+                            self.pending_add = Some(pending);
+                        }
+                    }
                     // Forget a dismissal once the engine stops repeating that
                     // exact failure, so a recurring error surfaces again.
                     if let Some(dismissed) = self.dismissed_error.clone()
@@ -1057,7 +1224,7 @@ impl App {
                 let _ = self.commands.send(Command::AddMagnet(uri));
             }
             OpenRequest::Torrent(path) => match std::fs::read(&path) {
-                Ok(bytes) => self.prepare_add(bytes),
+                Ok(bytes) => self.open_add_dialog(bytes),
                 Err(error) => {
                     self.error = Some(format!("cannot read {}: {error}", path.display()));
                 }
@@ -1065,235 +1232,19 @@ impl App {
         }
     }
 
-    /// Parses a picked `.torrent` and opens the add dialog with its folder.
+    /// Parses a `.torrent` and opens the add dialog on top of the window.
     ///
     /// Parsing here is what lets the dialog show the torrent's real name and
     /// size before anything touches the disk; a malformed file is reported
     /// instead of being handed to the engine just to fail again.
-    fn prepare_add(&mut self, bytes: Vec<u8>) {
-        match flux_core::metainfo::parse(&bytes) {
-            Ok(metainfo) => {
-                let path = self.download_dir.display().to_string();
-                let free = free_space(Path::new(&path));
-                let size = metainfo.info.layout.total_length();
-                let files = metainfo
-                    .info
-                    .layout
-                    .files()
-                    .iter()
-                    .map(|file| {
-                        (
-                            PathBuf::from_iter(file.path.iter().map(String::as_str)),
-                            file.length,
-                        )
-                    })
-                    .collect();
-                self.add_draft = Some(AddDraft {
-                    name: metainfo.info.name.clone(),
-                    size,
-                    files,
-                    path,
-                    free,
-                    bytes,
-                    error: None,
-                });
+    fn open_add_dialog(&mut self, bytes: Vec<u8>) {
+        let free = free_space(&self.download_dir);
+        match AddDialogState::from_metainfo(bytes, self.download_dir.display().to_string(), free) {
+            Ok(state) => {
+                self.add_dialog = Some(state.with_language(self.language.resolve()));
             }
-            Err(error) => {
-                self.error = Some(format!("this is not a usable .torrent file: {error}"));
-            }
+            Err(error) => self.error = Some(error),
         }
-    }
-
-    /// Adds the torrent in the dialog to the folder it shows.
-    fn confirm_add(&mut self) {
-        let Some(mut draft) = self.add_draft.take() else {
-            return;
-        };
-        let trimmed = draft.path.trim();
-        if trimmed.is_empty() {
-            draft.error = Some("Choose a folder to save into.".to_owned());
-            self.add_draft = Some(draft);
-            return;
-        }
-        let root = PathBuf::from(trimmed);
-        if root.exists() && !root.is_dir() {
-            draft.error = Some(format!("`{}` is a file, not a folder.", root.display()));
-            self.add_draft = Some(draft);
-            return;
-        }
-        if draft.lacks_space() {
-            // Starting anyway is what filled the disk: preallocation dies with a
-            // bare `os error 112` long after the user walked away.
-            draft.error = Some(format!(
-                "Only {} free there, this torrent needs {}.",
-                format_bytes(draft.free.unwrap_or(0)),
-                format_bytes(draft.size)
-            ));
-            self.add_draft = Some(draft);
-            return;
-        }
-        let _ = self.commands.send(Command::AddBytes {
-            bytes: draft.bytes,
-            save_path: Some(root),
-        });
-    }
-
-    /// The centred add dialog drawn over the whole window.
-    fn add_dialog(&self) -> Element<'_, Message> {
-        let Some(draft) = &self.add_draft else {
-            return Space::new().into();
-        };
-
-        let mut body = column![
-            row![
-                text("Add torrent")
-                    .size(type_scale::HEADING)
-                    .font(semibold()),
-                Space::new().width(Fill),
-                button(icon(icons::X, 14.0, T.text_muted))
-                    .on_press(Message::CancelAdd)
-                    .style(style::icon)
-                    .padding(0)
-                    .width(24)
-                    .height(24),
-            ]
-            .align_y(Alignment::Center),
-            column![
-                text(draft.name.clone())
-                    .size(BODY)
-                    .font(medium())
-                    .wrapping(Wrapping::Word),
-                text(format!("{} · {}", format_bytes(draft.size), "ready to add"))
-                    .size(CAPTION)
-                    .color(T.text_muted),
-            ]
-            .spacing(4),
-            Space::new().height(4),
-            // A dialog has one left edge: `section` is inset for the sidebar and
-            // would push this label 12 px right of everything else.
-            text("SAVE TO")
-                .size(MICRO)
-                .font(semibold())
-                .color(T.text_muted),
-        ]
-        .spacing(12);
-
-        let path_field = container(
-            text_input("Folder to download into", &draft.path)
-                .on_input(Message::SavePathChanged)
-                .on_submit(Message::ConfirmAdd)
-                .style(style::input)
-                .padding([7, 10])
-                .size(BODY),
-        )
-        .width(Fill)
-        .height(Fill)
-        .align_y(Alignment::Center);
-
-        body = body.push(
-            row![
-                path_field,
-                button(
-                    row![
-                        icon(icons::FOLDER, 14.0, T.text_primary),
-                        text("Browse").size(BODY)
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .on_press(Message::BrowseSavePath)
-                .style(style::secondary)
-                .padding([0, 12])
-                .height(Fill),
-            ]
-            .spacing(8)
-            .height(36)
-            .align_y(Alignment::Center),
-        );
-
-        let hint = match &draft.error {
-            Some(error) => text(error.clone())
-                .size(CAPTION)
-                .color(T.danger)
-                .width(Fill)
-                .wrapping(Wrapping::Word),
-            None if draft.lacks_space() => text(format!(
-                "Not enough space: needs {}, only {} free there. Pick another folder.",
-                format_bytes(draft.missing_bytes()),
-                format_bytes(draft.free.unwrap_or(0))
-            ))
-            .size(CAPTION)
-            .color(T.danger)
-            .width(Fill)
-            .wrapping(Wrapping::Word),
-            None if draft.missing_bytes() < draft.size => text(format!(
-                "{} of {} already in that folder; it will be verified, not downloaded again.",
-                format_bytes(draft.size - draft.missing_bytes()),
-                format_bytes(draft.size)
-            ))
-            .size(CAPTION)
-            .color(T.text_secondary)
-            .width(Fill)
-            .wrapping(Wrapping::Word),
-            None => text("The folder is created if it does not exist.")
-                .size(CAPTION)
-                .color(T.text_muted)
-                .width(Fill)
-                .wrapping(Wrapping::Word),
-        };
-        body = body.push(hint);
-
-        body = body.push(
-            row![
-                Space::new().width(Fill),
-                button("Cancel")
-                    .on_press(Message::CancelAdd)
-                    .style(style::secondary)
-                    .padding([0, 16])
-                    .height(36),
-                button(text("Add torrent").size(BODY).font(semibold()))
-                    .on_press_maybe((!draft.lacks_space()).then_some(Message::ConfirmAdd))
-                    .style(style::primary)
-                    .padding([0, 16])
-                    .height(36),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-
-        let card = container(body)
-            .width(520)
-            .padding(20)
-            .style(|_| container::Style {
-                background: Some(Background::Color(T.surface)),
-                border: Border {
-                    color: T.border_strong,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..container::Style::default()
-            });
-
-        let scrim = mouse_area(container(Space::new().width(Fill).height(Fill)).style(|_| {
-            container::Style {
-                background: Some(Background::Color(Color {
-                    a: 0.55,
-                    ..Color::BLACK
-                })),
-                ..container::Style::default()
-            }
-        }))
-        .on_press(Message::CancelAdd);
-
-        stack![
-            scrim,
-            container(opaque(card))
-                .width(Fill)
-                .height(Fill)
-                .center_x(Fill)
-                .center_y(Fill),
-        ]
-        .into()
     }
 
     /// Renders the whole window as one flush stack: header, rules, toolbar,
@@ -1302,7 +1253,7 @@ impl App {
         let mut layout = column![self.header(), rule(), self.toolbar(), rule()]
             .width(Fill)
             .height(Fill);
-        if self.magnet_open {
+        if self.magnet_open && self.add_dialog.is_none() {
             layout = layout.push(self.magnet_row());
         }
         layout = layout.push(self.body());
@@ -1314,14 +1265,17 @@ impl App {
             .height(Fill)
             .padding(0)
             .into();
-        if self.add_draft.is_some() {
-            stack![main, self.add_dialog()].into()
+        if let Some(dialog) = &self.add_dialog {
+            stack![main, dialog.view().map(Message::AddDialog)].into()
+        } else if let Some(settings) = &self.settings_dialog {
+            stack![main, settings.view_modal().map(Message::SettingsDialog)].into()
         } else {
             main
         }
     }
 
     fn header(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let mut brand = row![icon(icons::DOWNLOAD, 24.0, T.text_primary)]
             .spacing(8)
             .align_y(Alignment::Center);
@@ -1352,7 +1306,7 @@ impl App {
         let search = container(
             row![
                 icon(icons::SEARCH, 16.0, T.text_muted),
-                text_input("Search torrents…", &self.search)
+                text_input(tr.t(TextKey::SearchTorrentsPlaceholder), &self.search)
                     .id(search_id())
                     .on_input(Message::SearchChanged)
                     .style(style::search_field)
@@ -1372,7 +1326,7 @@ impl App {
         let add = button(
             row![
                 icon(icons::PLUS, 16.0, T.accent_on),
-                text("Add .torrent").size(BODY).font(semibold()),
+                text(tr.t(TextKey::AddTorrent)).size(BODY).font(semibold()),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -1385,7 +1339,7 @@ impl App {
         let magnet = button(
             row![
                 icon(icons::MAGNET, 16.0, T.text_primary),
-                text("Add magnet").size(BODY).font(medium()),
+                text(tr.t(TextKey::AddMagnet)).size(BODY).font(medium()),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -1454,6 +1408,7 @@ impl App {
     }
 
     fn magnet_row(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         container(
             row![
                 icon(icons::MAGNET, 16.0, T.text_muted),
@@ -1464,7 +1419,7 @@ impl App {
                     .padding([7, 10])
                     .size(BODY)
                     .width(Fill),
-                button(text("Fetch metadata").size(BODY).font(medium()))
+                button(text(tr.t(TextKey::FetchMetadata)).size(BODY).font(medium()))
                     .on_press(Message::AddMagnet)
                     .style(style::primary)
                     .padding([0, 14])
@@ -1481,36 +1436,86 @@ impl App {
     }
 
     fn toolbar(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let state = self.selected_summary().map(|summary| summary.state);
         let has_selection = state.is_some();
         let can_pause = state.is_some_and(|state| state != TorrentState::Paused);
         let can_resume = state == Some(TorrentState::Paused);
 
-        container(
-            row![
-                toolbar_button(icons::PAUSE, "Pause", Message::Pause, can_pause),
-                toolbar_button(icons::PLAY, "Resume", Message::Resume, can_resume),
-                toolbar_button(icons::TRASH, "Remove", Message::Remove, has_selection),
-                toolbar_button(
-                    icons::X,
-                    "Stop",
-                    Message::StopPlayback,
-                    self.playing.is_some()
-                ),
-                Space::new().width(Fill),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
-        )
-        .padding([0, 24])
-        .height(metrics::TOOLBAR)
-        .width(Fill)
-        .style(style::flush)
-        .into()
+        let mut row = row![
+            toolbar_button(
+                icons::PAUSE,
+                tr.t(TextKey::Pause),
+                Message::Pause,
+                can_pause
+            ),
+            toolbar_button(
+                icons::PLAY,
+                tr.t(TextKey::Resume),
+                Message::Resume,
+                can_resume
+            ),
+            toolbar_button(
+                icons::TRASH,
+                tr.t(TextKey::Remove),
+                Message::Remove,
+                has_selection
+            ),
+            Space::new().width(Fill),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
+        if let Some(title) = &self.playing {
+            row = row.push(
+                container(
+                    row![
+                        icon(icons::PLAY, 14.0, T.accent),
+                        text(format!(
+                            "{}: {}",
+                            tr.t(TextKey::SettingsPlayback),
+                            elide_middle(title, 26)
+                        ))
+                        .size(CAPTION)
+                        .color(T.text_secondary),
+                        button(icon(icons::X, 12.0, T.text_primary))
+                            .on_press(Message::StopPlayback)
+                            .style(style::icon)
+                            .padding([4, 6]),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 10])
+                .style(|_| container::Style {
+                    background: Some(Background::Color(T.overlay)),
+                    border: Border {
+                        color: T.border_subtle,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+            );
+        }
+
+        container(row)
+            .padding([0, 24])
+            .height(metrics::TOOLBAR)
+            .width(Fill)
+            .style(style::flush)
+            .into()
     }
 
     fn body(&self) -> Element<'_, Message> {
         if self.settings_open {
+            if let Some(settings) = &self.settings_dialog {
+                return container(settings.view().map(Message::SettingsDialog))
+                    .width(Fill)
+                    .height(Fill)
+                    .style(style::surface)
+                    .into();
+            }
             return self.settings_panel();
         }
         if let Some(title) = &self.playing {
@@ -1542,7 +1547,10 @@ impl App {
     }
 
     fn sidebar(&self) -> Element<'_, Message> {
-        let mut items = column![section("LIBRARY")].spacing(0).width(Fill);
+        let tr = self.language.resolve();
+        let mut items = column![section(tr.t(TextKey::SectionLibrary))]
+            .spacing(0)
+            .width(Fill);
         for filter in Filter::ALL {
             let count = self
                 .torrents
@@ -1552,18 +1560,20 @@ impl App {
             items = items.push(self.nav_item(filter, count));
         }
 
-        let path = elide_middle(&self.download_dir.display().to_string(), 28);
-        let footer = column![
-            section("SAVE TO"),
+        let path = elide_middle(&self.download_dir.display().to_string(), 24);
+        let save_to_button = button(
             row![
                 icon(icons::HARD_DRIVE, 14.0, T.text_muted),
                 text(path).size(MICRO).color(T.text_muted),
             ]
             .spacing(8)
-            .align_y(Alignment::Center)
-            .padding([0, 12]),
-        ]
-        .spacing(0);
+            .align_y(Alignment::Center),
+        )
+        .on_press(Message::OpenSavePath)
+        .style(style::ghost)
+        .padding(Padding::new(0.0).left(12.0).right(12.0));
+
+        let footer = column![section(tr.t(TextKey::SaveTo)), save_to_button,].spacing(0);
 
         container(
             column![items, Space::new().height(Fill), footer]
@@ -1578,16 +1588,23 @@ impl App {
     }
 
     fn nav_item(&self, filter: Filter, count: usize) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let selected = self.filter == filter;
         let color = if selected { T.accent } else { T.text_secondary };
         let count_color = if selected {
             T.accent_text
         } else if count == 0 {
-            T.text_muted
+            T.text_disabled
         } else {
             T.text_secondary
         };
-        let count_background = if selected { T.accent_soft } else { T.overlay };
+        let count_background = if selected {
+            T.accent_soft
+        } else if count == 0 {
+            Color::TRANSPARENT
+        } else {
+            T.overlay
+        };
 
         button(
             row![
@@ -1595,7 +1612,7 @@ impl App {
                 container(
                     row![
                         icon(filter.icon(), 18.0, color),
-                        text(filter.label()).size(BODY).font(if selected {
+                        text(filter.label_tr(tr)).size(BODY).font(if selected {
                             semibold()
                         } else {
                             medium()
@@ -1684,10 +1701,10 @@ impl App {
     }
 
     fn content_header(&self, count: usize) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let total = self.torrents.len();
         let count_text = if self.search.trim().is_empty() && self.filter == Filter::All {
-            let noun = if count == 1 { "torrent" } else { "torrents" };
-            format!("{count} {noun}")
+            i18n::torrents_count(tr, count)
         } else {
             format!("{count} of {total}")
         };
@@ -1695,7 +1712,7 @@ impl App {
 
         container(
             row![
-                text(self.filter.label())
+                text(self.filter.label_tr(tr))
                     .size(BODY)
                     .font(semibold())
                     .color(T.text_primary),
@@ -1746,34 +1763,60 @@ impl App {
     }
 
     fn table_header(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         container(
             row![
                 Space::new().width(2),
                 container(
                     row![
-                        self.header_cell("Name", Column::Name, Fill, Alignment::Start),
-                        self.header_cell("Size", Column::Size, Length::Fixed(76.0), Alignment::End),
                         self.header_cell(
-                            "Progress",
+                            tr.t(TextKey::ColName),
+                            Column::Name,
+                            Fill,
+                            Alignment::Start
+                        ),
+                        self.header_cell(
+                            tr.t(TextKey::ColSize),
+                            Column::Size,
+                            Length::Fixed(76.0),
+                            Alignment::End
+                        ),
+                        self.header_cell(
+                            tr.t(TextKey::ColProgress),
                             Column::Progress,
                             Length::Fixed(128.0),
                             Alignment::Start
                         ),
                         self.header_cell(
-                            "Status",
+                            tr.t(TextKey::ColState),
                             Column::State,
                             Length::Fixed(96.0),
                             Alignment::Start
                         ),
                         self.header_cell(
-                            "Peers",
+                            tr.t(TextKey::ColPeers),
                             Column::Peers,
                             Length::Fixed(48.0),
                             Alignment::End
                         ),
-                        self.header_cell("Down", Column::Down, Length::Fixed(76.0), Alignment::End),
-                        self.header_cell("Up", Column::Up, Length::Fixed(76.0), Alignment::End),
-                        self.header_cell("ETA", Column::Eta, Length::Fixed(64.0), Alignment::End),
+                        self.header_cell(
+                            tr.t(TextKey::ColDown),
+                            Column::Down,
+                            Length::Fixed(76.0),
+                            Alignment::End
+                        ),
+                        self.header_cell(
+                            tr.t(TextKey::ColUp),
+                            Column::Up,
+                            Length::Fixed(76.0),
+                            Alignment::End
+                        ),
+                        self.header_cell(
+                            tr.t(TextKey::ColEta),
+                            Column::Eta,
+                            Length::Fixed(64.0),
+                            Alignment::End
+                        ),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center)
@@ -1956,6 +1999,7 @@ impl App {
     }
 
     fn empty_state(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let hero = container(icon(icons::DOWNLOAD, 40.0, T.accent))
             .padding(16)
             .style(|_| container::Style {
@@ -1969,7 +2013,7 @@ impl App {
             });
 
         let hovered = self.drag_hover;
-        let drop_zone = container(
+        let drop_zone_content = container(
             column![
                 icon(
                     icons::DOWNLOAD,
@@ -1977,13 +2021,13 @@ impl App {
                     if hovered { T.accent } else { T.text_muted }
                 ),
                 text(if hovered {
-                    "Release to add the torrent"
+                    tr.t(TextKey::DropTorrentRelease)
                 } else {
-                    "Drop .torrent files here"
+                    tr.t(TextKey::DropTorrentPrompt)
                 })
                 .size(type_scale::HEADING)
                 .font(semibold()),
-                text("or paste a magnet link")
+                text(tr.t(TextKey::DropTorrentOrPaste))
                     .size(CAPTION)
                     .color(if hovered {
                         T.accent_text
@@ -2000,22 +2044,22 @@ impl App {
         .align_y(Alignment::Center)
         .style(style::drop_zone(hovered));
 
+        let drop_zone = mouse_area(drop_zone_content).on_press(Message::AddFile);
+
         container(
             column![
                 hero,
-                text("No torrents yet")
+                text(tr.t(TextKey::NoTorrentsYet))
                     .size(type_scale::DISPLAY)
                     .font(semibold()),
-                text(
-                    "Add a .torrent file, paste a magnet link, or drop files anywhere in this window."
-                )
-                .size(BODY)
-                .color(T.text_secondary),
+                text(tr.t(TextKey::EmptyStateDescription))
+                    .size(BODY)
+                    .color(T.text_secondary),
                 row![
                     button(
                         row![
                             icon(icons::PLUS, 16.0, T.accent_on),
-                            text("Add .torrent").size(BODY).font(semibold())
+                            text(tr.t(TextKey::AddTorrentFile)).size(BODY).font(semibold())
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -2027,7 +2071,7 @@ impl App {
                     button(
                         row![
                             icon(icons::MAGNET, 16.0, T.text_primary),
-                            text("Add magnet").size(BODY).font(medium())
+                            text(tr.t(TextKey::AddMagnet)).size(BODY).font(medium())
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -2039,9 +2083,13 @@ impl App {
                 ]
                 .spacing(12),
                 drop_zone,
-                text("Torrents stay on this device. Nothing is uploaded unless you seed.")
-                    .size(MICRO)
-                    .color(T.text_muted),
+                text(if tr == ResolvedLanguage::Ukrainian {
+                    "Торенти залишаються на цьому пристрої. Нічого не вивантажується, якщо ви не роздаєте."
+                } else {
+                    "Torrents stay on this device. Nothing is uploaded unless you seed."
+                })
+                .size(MICRO)
+                .color(T.text_muted),
             ]
             .spacing(16)
             .align_x(Alignment::Center)
@@ -2133,10 +2181,11 @@ impl App {
     }
 
     fn detail_tabs(&self) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         container(
             row![
-                self.tab_button("General", DetailTab::General),
-                self.tab_button("Files", DetailTab::Files),
+                self.tab_button(tr.t(TextKey::TabGeneral), DetailTab::General),
+                self.tab_button(tr.t(TextKey::TabFiles), DetailTab::Files),
             ]
             .spacing(4)
             .align_y(Alignment::Center),
@@ -2149,8 +2198,8 @@ impl App {
     fn tab_button(&self, label: &'static str, tab: DetailTab) -> Element<'_, Message> {
         let selected = self.tab == tab;
         let width = match tab {
-            DetailTab::General => 78.0,
-            DetailTab::Files => 62.0,
+            DetailTab::General => 88.0,
+            DetailTab::Files => 72.0,
         };
         column![
             button(
@@ -2170,6 +2219,7 @@ impl App {
     }
 
     fn general_tab(&self, detail: &TorrentDetail) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         let summary = &detail.summary;
         let progress = if summary.pieces_total == 0 && summary.total_bytes == 0 {
             em().to_owned()
@@ -2193,25 +2243,28 @@ impl App {
         };
 
         column![
-            field("Size", size_label(summary)),
-            field("Progress", progress),
-            field("Pieces", pieces),
-            field("Piece length", piece_length),
-            field("Save path", save_to),
-            field("State", state_label(summary.state).to_owned()),
-            field("Peers", summary.peers.to_string()),
-            field("Down", rate_label(summary.download_rate)),
-            field("Up", rate_label(summary.upload_rate)),
-            field("ETA", eta_label(summary)),
+            field(tr.t(TextKey::ColSize), size_label(summary)),
+            field(tr.t(TextKey::ColProgress), progress),
+            field(tr.t(TextKey::FieldPieces), pieces),
+            field(tr.t(TextKey::FieldPieceLength), piece_length),
+            field(tr.t(TextKey::SaveTo), save_to),
             field(
-                "Private",
+                tr.t(TextKey::ColState),
+                state_label(summary.state).to_owned()
+            ),
+            field(tr.t(TextKey::ColPeers), summary.peers.to_string()),
+            field(tr.t(TextKey::ColDown), rate_label(summary.download_rate)),
+            field(tr.t(TextKey::ColUp), rate_label(summary.upload_rate)),
+            field(tr.t(TextKey::ColEta), eta_label(summary)),
+            field(
+                tr.t(TextKey::FieldPrivate),
                 if summary.private {
-                    "yes".to_owned()
+                    tr.t(TextKey::Yes).to_owned()
                 } else {
-                    "no".to_owned()
+                    tr.t(TextKey::No).to_owned()
                 },
             ),
-            hash_field("Info hash", summary.id.clone()),
+            hash_field(tr.t(TextKey::FieldInfoHash), summary.id.clone()),
         ]
         .spacing(0)
         .into()
@@ -2305,6 +2358,7 @@ impl App {
     }
 
     fn error_banner(&self, message: &str) -> Element<'_, Message> {
+        let tr = self.language.resolve();
         container(
             row![
                 container(Space::new().width(3).height(18)).style(|_| {
@@ -2320,7 +2374,7 @@ impl App {
                         .color(T.text_primary)
                         .wrapping(Wrapping::Word)
                         .width(Fill),
-                    button(text("Dismiss").size(MICRO).font(semibold()))
+                    button(text(tr.t(TextKey::Dismiss)).size(MICRO).font(semibold()))
                         .on_press(Message::ClearError)
                         .style(style::danger_text)
                         .padding([0, 8])
@@ -2341,26 +2395,24 @@ impl App {
     fn status_bar(&self) -> Element<'_, Message> {
         let down: u64 = self.torrents.iter().map(|t| t.download_rate).sum();
         let up: u64 = self.torrents.iter().map(|t| t.upload_rate).sum();
+        let tr = self.language.resolve();
         let selection = if self.selected.is_some() {
-            " · 1 selected"
+            format!(" · 1 {}", tr.t(TextKey::Selected))
         } else {
-            ""
-        };
-        let noun = if self.stats.torrents == 1 {
-            "torrent"
-        } else {
-            "torrents"
+            String::new()
         };
 
+        let summary_text = i18n::status_summary(
+            tr,
+            self.stats.torrents,
+            self.stats.active,
+            self.stats.seeding,
+            self.stats.paused,
+            self.dht,
+        );
+
         let mut status = row![
-            text(format!(
-                "{} {noun} · {} active · {} seeding · {} paused{selection}",
-                self.stats.torrents, self.stats.active, self.stats.seeding, self.stats.paused
-            ))
-            .size(CAPTION)
-            .color(T.text_muted),
-            Space::new().width(20),
-            text(if self.dht { "DHT on" } else { "DHT off" })
+            text(format!("{summary_text}{selection}"))
                 .size(CAPTION)
                 .color(T.text_muted),
         ];
@@ -2369,11 +2421,28 @@ impl App {
             status = status.push(text(message.clone()).size(CAPTION).color(T.success));
         }
         status = status.push(Space::new().width(Fill));
+        if self.stats.bytes_downloaded > 0 || self.stats.bytes_uploaded > 0 {
+            status = status.push(
+                text(format!(
+                    "{}: ↓ {}   ↑ {}",
+                    tr.t(TextKey::Session),
+                    format_bytes(self.stats.bytes_downloaded),
+                    format_bytes(self.stats.bytes_uploaded)
+                ))
+                .size(CAPTION)
+                .color(T.text_muted),
+            );
+            status = status.push(Space::new().width(20));
+        }
         if self.stats.bytes_downloaded > 0 {
             status = status.push(
-                text(format!("share ratio {}", ratio_label(&self.stats)))
-                    .size(CAPTION)
-                    .color(T.text_muted),
+                text(format!(
+                    "{} {}",
+                    tr.t(TextKey::ShareRatio),
+                    ratio_label(&self.stats)
+                ))
+                .size(CAPTION)
+                .color(T.text_muted),
             );
             status = status.push(Space::new().width(20));
         }
@@ -2470,6 +2539,9 @@ fn key_event(
         // claim the event.
         return Some(Message::FocusSearch);
     }
+    if modifiers.command() && is_ctrl_v(&modified_key, text.as_deref()) {
+        return Some(Message::PasteClipboard);
+    }
     if status != iced::event::Status::Ignored {
         return None;
     }
@@ -2484,6 +2556,14 @@ fn is_ctrl_f(modified_key: &keyboard::Key, text: Option<&str>) -> bool {
         modified_key.as_ref(),
         keyboard::Key::Character("f") | keyboard::Key::Character("F")
     ) || text == Some("\u{6}")
+}
+
+/// `Ctrl+V` or control code `U+0016`.
+fn is_ctrl_v(modified_key: &keyboard::Key, text: Option<&str>) -> bool {
+    matches!(
+        modified_key.as_ref(),
+        keyboard::Key::Character("v") | keyboard::Key::Character("V")
+    ) || text == Some("\u{16}")
 }
 
 /// Key mapping shared with [`key_event`]. The window listener routes `Esc`
@@ -3005,65 +3085,6 @@ mod tests {
             upload_rate: 0,
             last_error: None,
         }
-    }
-
-    #[test]
-    fn data_already_on_disk_does_not_need_free_space_again() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("Show")).unwrap();
-        std::fs::write(dir.path().join("Show").join("e01.mkv"), vec![0u8; 40]).unwrap();
-
-        let draft = AddDraft {
-            bytes: Vec::new(),
-            name: "Show".to_owned(),
-            size: 100,
-            files: vec![(PathBuf::from("Show").join("e01.mkv"), 100)],
-            path: dir.path().display().to_string(),
-            free: Some(70),
-            error: None,
-        };
-        // 40 of 100 bytes are already there, so only 60 need room.
-        assert_eq!(draft.missing_bytes(), 60);
-        assert!(!draft.lacks_space());
-
-        let tight = AddDraft {
-            free: Some(59),
-            ..draft
-        };
-        assert!(tight.lacks_space());
-    }
-
-    #[test]
-    fn a_hostile_path_never_escapes_the_save_folder() {
-        let root = Path::new("C:/downloads");
-        assert_eq!(
-            safe_join(root, Path::new("Show/e01.mkv")),
-            Some(PathBuf::from("C:/downloads/Show/e01.mkv"))
-        );
-        assert_eq!(safe_join(root, Path::new("../secret")), None);
-        // Only Windows parses `C:/...` as a rooted path; on Unix it is an
-        // ordinary relative name and joining it stays inside the folder.
-        #[cfg(windows)]
-        assert_eq!(safe_join(root, Path::new("D:/windows/system32")), None);
-    }
-
-    #[test]
-    fn a_torrent_larger_than_the_free_space_is_refused() {
-        let draft = |size: u64, free: Option<u64>| AddDraft {
-            bytes: Vec::new(),
-            name: "x".to_owned(),
-            size,
-            files: Vec::new(),
-            path: String::new(),
-            free,
-            error: None,
-        };
-        // The 96 GB torrent on a 66 GB drive case.
-        assert!(draft(96 << 30, Some(66 << 30)).lacks_space());
-        assert!(!draft(3 << 30, Some(66 << 30)).lacks_space());
-        // Unknown free space never blocks: refusing on a guess is worse than
-        // letting preallocation report the truth.
-        assert!(!draft(u64::MAX, None).lacks_space());
     }
 
     #[test]

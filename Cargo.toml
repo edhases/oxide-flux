@@ -26,3 +26,8 @@ unsafe_code = "deny"
 all = { level = "deny", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
+
+# Build dependencies without debug info: smaller target/, faster links.
+# Workspace members keep the debug level from [profile.dev].
+[profile.dev.package."*"]
+debug = false

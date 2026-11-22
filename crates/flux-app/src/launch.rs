@@ -101,6 +101,9 @@ pub struct Settings {
     pub register_associations: bool,
     /// Playback engine choice.
     pub playback: PlaybackSettings,
+    /// Everything the settings dialog edits, saved so the next launch starts
+    /// with the same language, theme, folders and engine limits.
+    pub ui: crate::settings_dialog::SettingsState,
 }
 
 impl Default for Settings {
@@ -108,6 +111,7 @@ impl Default for Settings {
         Self {
             register_associations: true,
             playback: PlaybackSettings::default(),
+            ui: crate::settings_dialog::SettingsState::default(),
         }
     }
 }
@@ -156,7 +160,7 @@ pub struct Initial {
 #[derive(Debug)]
 pub enum Plan {
     /// Start the GUI.
-    Run(Initial),
+    Run(Box<Initial>),
     /// The process is done; exit with this status.
     Exit(i32),
 }
@@ -356,16 +360,16 @@ pub fn prepare(args: impl IntoIterator<Item = OsString>) -> Result<Plan, String>
             if let Some(request) = target {
                 initial.requests.push(request);
             }
-            Ok(Plan::Run(initial))
+            Ok(Plan::Run(Box::new(initial)))
         }
         Err(error) => {
             notices.push(format!("single-instance coordination unavailable: {error}"));
-            Ok(Plan::Run(Initial {
+            Ok(Plan::Run(Box::new(Initial {
                 requests: target.into_iter().collect(),
                 notices,
                 queue: None,
                 settings: settings.clone(),
-            }))
+            })))
         }
     }
 }
@@ -407,14 +411,37 @@ mod tests {
     fn settings_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
+        let ui = crate::settings_dialog::SettingsState {
+            language: crate::i18n::Language::Ukrainian,
+            default_download_path: "F:/downloads".to_owned(),
+            max_peers: 77,
+            ..crate::settings_dialog::SettingsState::default()
+        };
         let settings = Settings {
             register_associations: false,
             playback: PlaybackSettings::default(),
+            ui,
         };
         settings.save(&path).unwrap();
         let loaded = Settings::load(&path);
         assert!(!loaded.register_associations);
+        // The dialog's choices survive a restart instead of falling back to
+        // defaults; this is what makes language and folder selection stick.
+        assert_eq!(loaded.ui.language, crate::i18n::Language::Ukrainian);
+        assert_eq!(loaded.ui.default_download_path, "F:/downloads");
+        assert_eq!(loaded.ui.max_peers, 77);
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn old_settings_files_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // A file written before the ui section existed.
+        std::fs::write(&path, br#"{"register_associations":true}"#).unwrap();
+        let loaded = Settings::load(&path);
+        assert!(loaded.register_associations);
+        assert_eq!(loaded.ui.language, crate::i18n::Language::System);
     }
 
     #[test]
