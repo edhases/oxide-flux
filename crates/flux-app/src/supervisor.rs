@@ -17,8 +17,14 @@ use tokio::sync::mpsc;
 pub enum Command {
     /// Force a snapshot (also happens on ticks and session events).
     Refresh,
-    /// Add a `.torrent` file's bytes.
-    AddBytes(Vec<u8>),
+    /// Add a `.torrent` file's bytes, optionally into a chosen folder.
+    ///
+    /// `save_path` is the folder the user picked in the add dialog; `None`
+    /// keeps the engine's configured download directory.
+    AddBytes {
+        bytes: Vec<u8>,
+        save_path: Option<std::path::PathBuf>,
+    },
     /// Add a magnet URI (metadata is fetched from the swarm).
     AddMagnet(String),
     Pause(String),
@@ -129,9 +135,12 @@ async fn handle(
 ) -> bool {
     match command {
         Command::Refresh => {}
-        Command::AddBytes(bytes) => report(
+        Command::AddBytes { bytes, save_path } => report(
             events,
-            engine.add(AddTorrent::Metainfo { bytes }).await.map(|_| ()),
+            engine
+                .add(AddTorrent::Metainfo { bytes, save_path })
+                .await
+                .map(|_| ()),
         ),
         Command::AddMagnet(uri) => report(
             events,

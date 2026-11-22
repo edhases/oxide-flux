@@ -104,6 +104,20 @@ Dependency direction: `daemon → api → (nothing)`, `daemon → core + disk + 
   range server; `stream_source.rs` polls `piece_state` until every covering piece is verified,
   then reads through `FileSet`. Never return unverified bytes, and keep the server bound to
   loopback (it has no auth). `Engine::stream_url` caches one server per torrent.
+- **Per-torrent save path.** `SessionHandle::add_torrent_with_root` resolves `Torrent.root` once
+  (caller's folder or `config.download_dir`) and every filesystem path for that torrent — prepare,
+  verification, swarm writer/reader, streaming and `delete_files` — must use it, never the global
+  config. `AddTorrent::Metainfo.save_path` carries it over JSON-RPC; persistence writes
+  `TorrentRecord.download_dir` only when it differs from the configured default, so existing state
+  files stay unchanged. `root` is reported back on `TorrentState` and `TorrentDetail.download_dir`.
+- **The add dialog refuses a torrent bigger than the free space on the chosen drive.** The desktop
+  client parses the metainfo, shows name and size, and measures the volume
+  (`GetDiskFreeSpaceExW`); Add is disabled while the torrent cannot fit. Preallocation would
+  otherwise start and die with a bare `os error 112` after the disk is already full.
+- **Release builds are Windows-subsystem binaries.** `main.rs` sets
+  `windows_subsystem = "windows"` outside debug so Explorer and the installer do not open a
+  console window; `launch::attach_parent_console` reattaches to a parent terminal so `--version`,
+  `--help` and `--register` output still appears. Do not drop either half.
 - **Play flow:** the UI asks the supervisor for a stream URL; the supervisor sets sequential
   mode + playhead to the file's first piece, then the app resolves the window HWND, scale and
   size and calls `play_embedded` with a physical-pixel rectangle.

@@ -12,7 +12,8 @@ use flux_api::{FileView, Priority, Stats, TorrentDetail, TorrentState, TorrentSu
 use flux_daemon::Config;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, pick_list, progress_bar, row, scrollable, text, text_input,
+    Space, button, column, container, mouse_area, opaque, pick_list, progress_bar, row, scrollable,
+    stack, text, text_input,
 };
 #[cfg(windows)]
 use iced::window::raw_window_handle::RawWindowHandle;
@@ -214,6 +215,31 @@ impl From<Priority> for PriorityChoice {
     }
 }
 
+/// A `.torrent` that has been picked but not added yet.
+///
+/// The bytes are kept so the engine never has to re-read the file, and the
+/// dialog shows the name and size the metainfo actually declares.
+struct AddDraft {
+    bytes: Vec<u8>,
+    name: String,
+    size: u64,
+    /// Editable save folder; starts at the default download directory.
+    path: String,
+    /// Free bytes on the drive that currently holds `path`, when measurable.
+    free: Option<u64>,
+    error: Option<String>,
+}
+
+impl AddDraft {
+    /// Whether the torrent cannot fit on the selected drive.
+    ///
+    /// Preallocation would otherwise start and die halfway through with a bare
+    /// `os error 112`, which is exactly how a 96 GB torrent fills a 66 GB disk.
+    fn lacks_space(&self) -> bool {
+        self.free.is_some_and(|free| self.size > free)
+    }
+}
+
 /// UI messages.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -228,6 +254,14 @@ pub enum Message {
     Tab(DetailTab),
     AddFile,
     FilePicked(Option<Vec<u8>>),
+    /// The add dialog's save-folder field changed.
+    SavePathChanged(String),
+    /// Ask for a folder for the torrent waiting in the add dialog.
+    BrowseSavePath,
+    SavePathPicked(Option<PathBuf>),
+    /// Add the torrent in the dialog using the chosen folder.
+    ConfirmAdd,
+    CancelAdd,
     ToggleMagnet,
     MagnetChanged(String),
     AddMagnet,
@@ -294,6 +328,8 @@ pub struct App {
     detail: Option<TorrentDetail>,
     magnet_open: bool,
     magnet_input: String,
+    /// A `.torrent` that is waiting for the user to confirm its folder.
+    add_draft: Option<AddDraft>,
     error: Option<String>,
     dismissed_error: Option<String>,
     player: Player,
@@ -366,6 +402,7 @@ impl App {
             detail: None,
             magnet_open: false,
             magnet_input: String::new(),
+            add_draft: None,
             error,
             dismissed_error: None,
             player: {
@@ -456,7 +493,9 @@ impl App {
                 return iced::widget::operation::focus(search_id());
             }
             Message::Escape => {
-                if self.settings_open {
+                if self.add_draft.is_some() {
+                    self.add_draft = None;
+                } else if self.settings_open {
                     self.settings_open = false;
                 } else if self.playing.is_some() {
                     self.stop_playback();
@@ -485,9 +524,33 @@ impl App {
             Message::AddFile => return Task::perform(pick_torrent(), Message::FilePicked),
             Message::FilePicked(bytes) => {
                 if let Some(bytes) = bytes {
-                    let _ = self.commands.send(Command::AddBytes(bytes));
+                    self.prepare_add(bytes);
                 }
             }
+            Message::SavePathChanged(path) => {
+                if let Some(draft) = &mut self.add_draft {
+                    draft.free = free_space(Path::new(path.trim()));
+                    draft.path = path;
+                    draft.error = None;
+                }
+            }
+            Message::BrowseSavePath => {
+                let start = self
+                    .add_draft
+                    .as_ref()
+                    .map(|draft| PathBuf::from(draft.path.trim()))
+                    .filter(|path| path.is_dir());
+                return Task::perform(pick_folder(start), Message::SavePathPicked);
+            }
+            Message::SavePathPicked(path) => {
+                if let (Some(draft), Some(path)) = (&mut self.add_draft, path) {
+                    draft.free = free_space(&path);
+                    draft.path = path.display().to_string();
+                    draft.error = None;
+                }
+            }
+            Message::ConfirmAdd => self.confirm_add(),
+            Message::CancelAdd => self.add_draft = None,
             Message::ToggleMagnet => self.magnet_open = !self.magnet_open,
             Message::MagnetChanged(value) => self.magnet_input = value,
             Message::AddMagnet => {
@@ -656,9 +719,7 @@ impl App {
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
                 {
                     match std::fs::read(&path) {
-                        Ok(bytes) => {
-                            let _ = self.commands.send(Command::AddBytes(bytes));
-                        }
+                        Ok(bytes) => self.prepare_add(bytes),
                         Err(error) => {
                             self.error = Some(format!("cannot read {}: {error}", path.display()));
                         }
@@ -922,7 +983,7 @@ impl App {
                 Event::StreamReady { url, title } => {
                     self.pending_stream = Some((url, title));
                 }
-                Event::Error(message) => self.error = Some(message),
+                Event::Error(message) => self.error = Some(hint_for_error(message)),
                 Event::Closed => {
                     self.engine_closed = true;
                     if !self.closing {
@@ -958,14 +1019,220 @@ impl App {
                 let _ = self.commands.send(Command::AddMagnet(uri));
             }
             OpenRequest::Torrent(path) => match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let _ = self.commands.send(Command::AddBytes(bytes));
-                }
+                Ok(bytes) => self.prepare_add(bytes),
                 Err(error) => {
                     self.error = Some(format!("cannot read {}: {error}", path.display()));
                 }
             },
         }
+    }
+
+    /// Parses a picked `.torrent` and opens the add dialog with its folder.
+    ///
+    /// Parsing here is what lets the dialog show the torrent's real name and
+    /// size before anything touches the disk; a malformed file is reported
+    /// instead of being handed to the engine just to fail again.
+    fn prepare_add(&mut self, bytes: Vec<u8>) {
+        match flux_core::metainfo::parse(&bytes) {
+            Ok(metainfo) => {
+                let path = self.download_dir.display().to_string();
+                let free = free_space(Path::new(&path));
+                self.add_draft = Some(AddDraft {
+                    name: metainfo.info.name.clone(),
+                    size: metainfo.info.layout.total_length(),
+                    path,
+                    free,
+                    bytes,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                self.error = Some(format!("this is not a usable .torrent file: {error}"));
+            }
+        }
+    }
+
+    /// Adds the torrent in the dialog to the folder it shows.
+    fn confirm_add(&mut self) {
+        let Some(mut draft) = self.add_draft.take() else {
+            return;
+        };
+        let trimmed = draft.path.trim();
+        if trimmed.is_empty() {
+            draft.error = Some("Choose a folder to save into.".to_owned());
+            self.add_draft = Some(draft);
+            return;
+        }
+        let root = PathBuf::from(trimmed);
+        if root.exists() && !root.is_dir() {
+            draft.error = Some(format!("`{}` is a file, not a folder.", root.display()));
+            self.add_draft = Some(draft);
+            return;
+        }
+        if draft.lacks_space() {
+            // Starting anyway is what filled the disk: preallocation dies with a
+            // bare `os error 112` long after the user walked away.
+            draft.error = Some(format!(
+                "Only {} free there, this torrent needs {}.",
+                format_bytes(draft.free.unwrap_or(0)),
+                format_bytes(draft.size)
+            ));
+            self.add_draft = Some(draft);
+            return;
+        }
+        let _ = self.commands.send(Command::AddBytes {
+            bytes: draft.bytes,
+            save_path: Some(root),
+        });
+    }
+
+    /// The centred add dialog drawn over the whole window.
+    fn add_dialog(&self) -> Element<'_, Message> {
+        let Some(draft) = &self.add_draft else {
+            return Space::new().into();
+        };
+
+        let mut body = column![
+            row![
+                text("Add torrent")
+                    .size(type_scale::HEADING)
+                    .font(semibold()),
+                Space::new().width(Fill),
+                button(icon(icons::X, 14.0, T.text_muted))
+                    .on_press(Message::CancelAdd)
+                    .style(style::icon)
+                    .padding(0)
+                    .width(24)
+                    .height(24),
+            ]
+            .align_y(Alignment::Center),
+            column![
+                text(draft.name.clone())
+                    .size(BODY)
+                    .font(medium())
+                    .wrapping(Wrapping::Word),
+                text(format!("{} · {}", format_bytes(draft.size), "ready to add"))
+                    .size(CAPTION)
+                    .color(T.text_muted),
+            ]
+            .spacing(4),
+            Space::new().height(4),
+            // A dialog has one left edge: `section` is inset for the sidebar and
+            // would push this label 12 px right of everything else.
+            text("SAVE TO")
+                .size(MICRO)
+                .font(semibold())
+                .color(T.text_muted),
+        ]
+        .spacing(12);
+
+        let path_field = container(
+            text_input("Folder to download into", &draft.path)
+                .on_input(Message::SavePathChanged)
+                .on_submit(Message::ConfirmAdd)
+                .style(style::input)
+                .padding([7, 10])
+                .size(BODY),
+        )
+        .width(Fill)
+        .height(Fill)
+        .align_y(Alignment::Center);
+
+        body = body.push(
+            row![
+                path_field,
+                button(
+                    row![
+                        icon(icons::FOLDER, 14.0, T.text_primary),
+                        text("Browse").size(BODY)
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::BrowseSavePath)
+                .style(style::secondary)
+                .padding([0, 12])
+                .height(Fill),
+            ]
+            .spacing(8)
+            .height(36)
+            .align_y(Alignment::Center),
+        );
+
+        let hint = match &draft.error {
+            Some(error) => text(error.clone())
+                .size(CAPTION)
+                .color(T.danger)
+                .width(Fill)
+                .wrapping(Wrapping::Word),
+            None if draft.lacks_space() => text(format!(
+                "Not enough space: needs {}, only {} free there. Pick another folder.",
+                format_bytes(draft.size),
+                format_bytes(draft.free.unwrap_or(0))
+            ))
+            .size(CAPTION)
+            .color(T.danger)
+            .width(Fill)
+            .wrapping(Wrapping::Word),
+            None => text("The folder is created if it does not exist.")
+                .size(CAPTION)
+                .color(T.text_muted)
+                .width(Fill)
+                .wrapping(Wrapping::Word),
+        };
+        body = body.push(hint);
+
+        body = body.push(
+            row![
+                Space::new().width(Fill),
+                button("Cancel")
+                    .on_press(Message::CancelAdd)
+                    .style(style::secondary)
+                    .padding([0, 16])
+                    .height(36),
+                button(text("Add torrent").size(BODY).font(semibold()))
+                    .on_press_maybe((!draft.lacks_space()).then_some(Message::ConfirmAdd))
+                    .style(style::primary)
+                    .padding([0, 16])
+                    .height(36),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+
+        let card = container(body)
+            .width(520)
+            .padding(20)
+            .style(|_| container::Style {
+                background: Some(Background::Color(T.surface)),
+                border: Border {
+                    color: T.border_strong,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..container::Style::default()
+            });
+
+        let scrim = mouse_area(container(Space::new().width(Fill).height(Fill)).style(|_| {
+            container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.55,
+                    ..Color::BLACK
+                })),
+                ..container::Style::default()
+            }
+        }))
+        .on_press(Message::CancelAdd);
+
+        stack![
+            scrim,
+            container(opaque(card))
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill),
+        ]
+        .into()
     }
 
     /// Renders the whole window as one flush stack: header, rules, toolbar,
@@ -980,12 +1247,17 @@ impl App {
         layout = layout.push(self.body());
         layout = layout.push(rule());
         layout = layout.push(self.status_bar());
-        container(layout)
+        let main: Element<'_, Message> = container(layout)
             .style(style::canvas)
             .width(Fill)
             .height(Fill)
             .padding(0)
-            .into()
+            .into();
+        if self.add_draft.is_some() {
+            stack![main, self.add_dialog()].into()
+        } else {
+            main
+        }
     }
 
     fn header(&self) -> Element<'_, Message> {
@@ -1031,9 +1303,9 @@ impl App {
             .spacing(8)
             .align_y(Alignment::Center),
         )
-        .height(32)
+        .height(36)
         .width(320)
-        .padding([0, 10])
+        .padding([0, 12])
         .style(style::search_shell);
 
         let add = button(
@@ -1974,7 +2246,7 @@ impl App {
     fn error_banner(&self, message: &str) -> Element<'_, Message> {
         container(
             row![
-                container(Space::new().width(3).height(40)).style(|_| {
+                container(Space::new().width(3).height(18)).style(|_| {
                     container::Style {
                         background: Some(Background::Color(T.danger)),
                         ..container::Style::default()
@@ -1996,12 +2268,10 @@ impl App {
                 .spacing(8)
                 .align_y(Alignment::Center)
                 .width(Fill)
-                .padding(Padding::new(0.0).left(12.0).right(12.0)),
+                .padding(Padding::new(10.0).left(12.0).right(12.0)),
             ]
-            .height(40)
             .width(Fill),
         )
-        .height(40)
         .width(Fill)
         .style(style::error_banner)
         .into()
@@ -2038,12 +2308,14 @@ impl App {
             status = status.push(text(message.clone()).size(CAPTION).color(T.success));
         }
         status = status.push(Space::new().width(Fill));
-        status = status.push(
-            text(format!("session {}", ratio_label(&self.stats)))
-                .size(CAPTION)
-                .color(T.text_muted),
-        );
-        status = status.push(Space::new().width(20));
+        if self.stats.bytes_downloaded > 0 {
+            status = status.push(
+                text(format!("share ratio {}", ratio_label(&self.stats)))
+                    .size(CAPTION)
+                    .color(T.text_muted),
+            );
+            status = status.push(Space::new().width(20));
+        }
         status = status.push(
             text(format!(
                 "↓ {}/s   ↑ {}/s",
@@ -2465,6 +2737,19 @@ fn ratio_label(stats: &Stats) -> String {
     }
 }
 
+/// Adds the fix a bare OS error does not suggest.
+fn hint_for_error(message: String) -> String {
+    // Preallocation fails with `ERROR_DISK_FULL` (112) when the chosen folder is
+    // on a drive that cannot hold the torrent; the raw message gives no clue
+    // that the folder is the thing to change.
+    if message.contains("os error 112") || message.contains("not enough space") {
+        return format!(
+            "{message} · free space on that drive or pick another folder when adding the torrent"
+        );
+    }
+    message
+}
+
 fn percent_color(state: TorrentState, fraction: f32) -> Color {
     match state {
         TorrentState::Error => T.danger,
@@ -2582,6 +2867,62 @@ async fn pick_torrent() -> Option<Vec<u8>> {
     Some(file.read().await)
 }
 
+/// Asks for a download folder, starting at `start` when it still exists.
+async fn pick_folder(start: Option<PathBuf>) -> Option<PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new();
+    if let Some(start) = start {
+        dialog = dialog.set_directory(start);
+    }
+    dialog
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_path_buf())
+}
+
+/// Free bytes available on the volume that would hold `path`.
+///
+/// The folder may not exist yet, so the nearest existing ancestor is measured;
+/// that is the same drive `verify::prepare` will create the files on. `None`
+/// means the volume cannot be queried, and the dialog then simply warns less.
+fn free_space(path: &Path) -> Option<u64> {
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        if !probe.pop() {
+            return None;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide: Vec<u16> = probe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut available = 0u64;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path and the out-pointer is
+        // a live `u64`; the total-size arguments may be null.
+        #[allow(unsafe_code)]
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { None } else { Some(available) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = probe;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2603,6 +2944,35 @@ mod tests {
             upload_rate: 0,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn a_torrent_larger_than_the_free_space_is_refused() {
+        let draft = |size: u64, free: Option<u64>| AddDraft {
+            bytes: Vec::new(),
+            name: "x".to_owned(),
+            size,
+            path: String::new(),
+            free,
+            error: None,
+        };
+        // The 96 GB torrent on a 66 GB drive case.
+        assert!(draft(96 << 30, Some(66 << 30)).lacks_space());
+        assert!(!draft(3 << 30, Some(66 << 30)).lacks_space());
+        // Unknown free space never blocks: refusing on a guess is worse than
+        // letting preallocation report the truth.
+        assert!(!draft(u64::MAX, None).lacks_space());
+    }
+
+    #[test]
+    fn disk_full_errors_point_at_the_save_folder() {
+        let message = "i/o error: i/o error on `x/file.cok`: There is not enough space on the disk. (os error 112)";
+        let hint = hint_for_error(message.to_owned());
+        assert!(hint.starts_with(message));
+        assert!(hint.contains("pick another folder"));
+
+        let other = "tracker responded 404";
+        assert_eq!(hint_for_error(other.to_owned()), other);
     }
 
     #[test]

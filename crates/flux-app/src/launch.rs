@@ -223,6 +223,30 @@ fn parse_target(target: &str) -> Result<OpenRequest, String> {
     Ok(OpenRequest::Torrent(path))
 }
 
+/// Reattaches this process to the console that started it, when there is one.
+///
+/// Release builds use the Windows GUI subsystem (see `main.rs`), so a launch
+/// from Explorer or from the installer must not create a console window. The
+/// same subsystem choice leaves the standard handles unset, which would hide
+/// `--version`, `--help`, `--register` and `--unregister` output when the app
+/// *is* started from a terminal; attaching to the parent console restores
+/// stdout/stderr there. A process without a parent console is unaffected: the
+/// call simply fails and is ignored.
+pub fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+        // SAFETY: `AttachConsole` only reads the constant and the parent
+        // process id; a failure (no parent console, already attached) returns
+        // zero and needs no cleanup.
+        #[allow(unsafe_code)]
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 /// Runs every pre-GUI step and returns either the GUI boot state or an exit code.
 ///
 /// # Errors
